@@ -23,6 +23,8 @@ static const uint32_t DEMO_TICKS_PER_LOOP = (MC_TICKS_PER_DAY * 50) / (DEMO_CYCL
 
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite frame = TFT_eSprite(&tft);
+TFT_eSPI* canvas = &tft;   // points at frame once the sprite buffer allocates
+bool spriteReady = false;  // draw calls silently no-op on an un-created sprite
 
 uint32_t lastPollMs = 0;
 uint32_t currentTicks = 0;      // 0..23999, last known-good value from bridge (or simulated in demo mode)
@@ -92,14 +94,14 @@ static const uint16_t HAND_BLACK = 0x0000;
 enum class ClockStatus { LIVE, OFFLINE, DEMO };
 
 void drawClockFace(uint32_t ticks, ClockStatus status) {
-  frame.fillSprite(TFT_BLACK);
+  canvas->fillScreen(TFT_BLACK); // fillScreen == fillSprite when canvas is the sprite; works on both
 
   // Gold case: two concentric rings (outer = darker gold shadow edge, inner
   // = brighter gold face of the bezel), then the cream dial on top.
-  frame.fillSmoothCircle(CENTER, CENTER, DIAL_RADIUS + 16, GOLD_DARK);
-  frame.fillSmoothCircle(CENTER, CENTER, DIAL_RADIUS + 11, GOLD_LIGHT);
-  frame.fillSmoothCircle(CENTER, CENTER, DIAL_RADIUS + 2, GOLD_DARK);
-  frame.fillSmoothCircle(CENTER, CENTER, DIAL_RADIUS, FACE_CREAM);
+  canvas->fillSmoothCircle(CENTER, CENTER, DIAL_RADIUS + 16, GOLD_DARK);
+  canvas->fillSmoothCircle(CENTER, CENTER, DIAL_RADIUS + 11, GOLD_LIGHT);
+  canvas->fillSmoothCircle(CENTER, CENTER, DIAL_RADIUS + 2, GOLD_DARK);
+  canvas->fillSmoothCircle(CENTER, CENTER, DIAL_RADIUS, FACE_CREAM);
 
   // 8 tick marks around the rim, like the notches on the real item texture.
   for (int i = 0; i < 8; i++) {
@@ -108,7 +110,7 @@ void drawClockFace(uint32_t ticks, ClockStatus status) {
     int y1 = CENTER + sinf(a) * (DIAL_RADIUS - 6);
     int x2 = CENTER + cosf(a) * (DIAL_RADIUS - 14);
     int y2 = CENTER + sinf(a) * (DIAL_RADIUS - 14);
-    frame.drawWideLine(x1, y1, x2, y2, 3, GOLD_DARK);
+    canvas->drawWideLine(x1, y1, x2, y2, 3, GOLD_DARK);
   }
 
   // The hand: tick 0 (sunrise) points straight up, sweeping clockwise
@@ -125,10 +127,10 @@ void drawClockFace(uint32_t ticks, ClockStatus status) {
   int by1 = CENTER + sinf(perpRad) * baseHalfWidth;
   int bx2 = CENTER - cosf(perpRad) * baseHalfWidth;
   int by2 = CENTER - sinf(perpRad) * baseHalfWidth;
-  frame.fillTriangle(bx1, by1, bx2, by2, tipX, tipY, HAND_BLACK);
+  canvas->fillTriangle(bx1, by1, bx2, by2, tipX, tipY, HAND_BLACK);
 
   // Center hub
-  frame.fillSmoothCircle(CENTER, CENTER, 6, HAND_BLACK);
+  canvas->fillSmoothCircle(CENTER, CENTER, 6, HAND_BLACK);
 
   // HUD text: HH:MM in-game time + connection dot
   uint32_t totalMinutes = (uint32_t)((ticks / (float)MC_TICKS_PER_DAY) * 24.0f * 60.0f);
@@ -140,24 +142,27 @@ void drawClockFace(uint32_t ticks, ClockStatus status) {
   char buf[8];
   snprintf(buf, sizeof(buf), "%02lu:%02lu", hh, mm);
 
-  frame.setTextDatum(MC_DATUM);
-  frame.setTextColor(HAND_BLACK, FACE_CREAM);
-  frame.drawString(buf, CENTER, CENTER + DIAL_RADIUS - 30, 4);
+  canvas->setTextDatum(MC_DATUM);
+  canvas->setTextColor(HAND_BLACK, FACE_CREAM);
+  canvas->drawString(buf, CENTER, CENTER + DIAL_RADIUS - 30, 4);
 
   uint16_t dotColor = TFT_RED;
   if (status == ClockStatus::LIVE) dotColor = TFT_DARKGREEN;
   else if (status == ClockStatus::DEMO) dotColor = TFT_ORANGE;
-  frame.fillCircle(CENTER, CENTER + DIAL_RADIUS - 4, 4, dotColor);
+  canvas->fillCircle(CENTER, CENTER + DIAL_RADIUS - 4, 4, dotColor);
 
   if (status == ClockStatus::DEMO) {
-    frame.setTextColor(TFT_ORANGE, FACE_CREAM);
-    frame.drawString("DEMO", CENTER, CENTER - DIAL_RADIUS + 22, 2);
+    canvas->setTextColor(TFT_ORANGE, FACE_CREAM);
+    canvas->drawString("DEMO", CENTER, CENTER - DIAL_RADIUS + 22, 2);
   } else if (status == ClockStatus::OFFLINE) {
-    frame.setTextColor(TFT_RED, FACE_CREAM);
-    frame.drawString("OFFLINE", CENTER, CENTER - DIAL_RADIUS + 22, 2);
+    canvas->setTextColor(TFT_RED, FACE_CREAM);
+    canvas->drawString("OFFLINE", CENTER, CENTER - DIAL_RADIUS + 22, 2);
   }
 
-  frame.pushSprite(0, 0);
+  // pushSprite is only meaningful when we're actually drawing into the
+  // off-screen sprite; if allocation failed, canvas points straight at
+  // tft and every draw call above already landed on the real screen.
+  if (spriteReady) frame.pushSprite(0, 0);
 }
 
 // ---- main -------------------------------------------------------
@@ -168,8 +173,25 @@ void setup() {
   tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
 
+  // Immediate on-screen feedback, drawn straight to tft (no sprite involved
+  // yet) so you see *something* right away instead of a black screen during
+  // the up-to-15s WiFi connect attempt below.
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Connecting...", CENTER, CENTER, 4);
+
   frame.setColorDepth(16);
-  frame.createSprite(SCREEN_SIZE, SCREEN_SIZE);
+  void* spriteBuf = frame.createSprite(SCREEN_SIZE, SCREEN_SIZE);
+  if (spriteBuf != nullptr) {
+    canvas = &frame;
+    spriteReady = true;
+    Serial.println("Sprite allocated OK, drawing double-buffered");
+  } else {
+    // Out of heap for a 240x240x16bpp (115200 byte) buffer - fall back to
+    // drawing straight to the panel. Every drawClockFace() call below
+    // still works, it just isn't double-buffered (may flicker slightly).
+    Serial.println("WARNING: sprite allocation FAILED, drawing directly to TFT");
+  }
 
   wifiConnected = connectWiFi();
 
