@@ -138,15 +138,27 @@ float angularDelta(float a, float b) {
   return fabsf(d - PI);
 }
 
+// The real clock item's window only ever reveals a small sliver of a much
+// larger rotating dial - showing the dial's *entire* extent stretched
+// across the whole screen (zoom 1.0) looks like a spinning wheel, not a
+// window. DIAL_ZOOM shrinks the sampled region to 1/DIAL_ZOOM of the
+// dial's extent, magnifying that smaller slice to fill the screen instead
+// - 2.0 means only half the dial's width/height is ever visible at once.
+// Nearest-neighbor indexing below (int truncation, no interpolation) is
+// unchanged, so raising DIAL_ZOOM makes each dial texel cover *more*
+// screen pixels - blockier, not smoother, matching the wiki algorithm's
+// own direct pixel lookup (no bilinear filtering in the original either).
+static const float DIAL_ZOOM = 2.0f;
+
 void renderDial(float dialAngle) {
   float rx = sinf(-dialAngle);
   float ry = cosf(-dialAngle);
   for (uint16_t y = 0; y < SCREEN_SIZE; y++) {
-    float v = y / (float)(SCREEN_SIZE - 1) - 0.5f;
+    float v = (y / (float)(SCREEN_SIZE - 1) - 0.5f) / DIAL_ZOOM;
     TFT_eSPI* surface = surfaceFor(y);
     uint16_t ly = localY(y);
     for (uint16_t x = 0; x < SCREEN_SIZE; x++) {
-      float u = -(x / (float)(SCREEN_SIZE - 1) - 0.5f);
+      float u = -(x / (float)(SCREEN_SIZE - 1) - 0.5f) / DIAL_ZOOM;
       int32_t dx = (int32_t)((u * ry + v * rx + 0.5f) * DIAL_WIDTH)  % DIAL_WIDTH;
       int32_t dy = (int32_t)((v * ry - u * rx + 0.5f) * DIAL_HEIGHT) % DIAL_HEIGHT;
       if (dx < 0) dx += DIAL_WIDTH;
