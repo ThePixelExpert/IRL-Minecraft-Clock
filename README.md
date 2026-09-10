@@ -1,8 +1,10 @@
 # mc-clock-esp32
 
 ESP32 + 1.28" round GC9A01 TFT (240x240) displaying live Minecraft server
-time as an animated Minecraft-style clock (rotating sun/moon dial, sky color
-shifts with time of day).
+time as an animated Minecraft-style clock: a gold pocket-watch case with a
+cream face and a single black hand that sweeps one full turn per in-game
+day (24000 ticks) — a from-scratch recreation of the vanilla clock item's
+animation, not the extracted game texture.
 
 ## Architecture
 

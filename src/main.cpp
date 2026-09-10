@@ -10,7 +10,6 @@
 static const uint16_t SCREEN_SIZE = 240;
 static const uint16_t CENTER = SCREEN_SIZE / 2;
 static const uint16_t DIAL_RADIUS = 108;
-static const uint16_t BODY_RADIUS = 18;   // sun/moon disc size
 static const uint32_t POLL_INTERVAL_MS = 3000;
 static const uint32_t MC_TICKS_PER_DAY = 24000;
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
@@ -30,35 +29,6 @@ uint32_t currentTicks = 0;      // 0..23999, last known-good value from bridge (
 bool haveValidTime = false;     // true if the most recent poll succeeded
 bool everHadValidTime = false;  // true once we've received at least one real reading
 bool wifiConnected = false;
-
-// ---- colour helpers -------------------------------------------------------
-
-uint16_t lerpColor(uint16_t c1, uint16_t c2, float t) {
-  t = constrain(t, 0.0f, 1.0f);
-  uint8_t r1 = (c1 >> 11) & 0x1F, g1 = (c1 >> 5) & 0x3F, b1 = c1 & 0x1F;
-  uint8_t r2 = (c2 >> 11) & 0x1F, g2 = (c2 >> 5) & 0x3F, b2 = c2 & 0x1F;
-  uint8_t r = r1 + (r2 - r1) * t;
-  uint8_t g = g1 + (g2 - g1) * t;
-  uint8_t b = b1 + (b2 - b1) * t;
-  return (r << 11) | (g << 5) | b;
-}
-
-// Sky colour across the Minecraft day cycle: dawn -> day -> dusk -> night -> dawn
-uint16_t skyColorForTicks(uint32_t ticks) {
-  const uint16_t NIGHT  = tft.color565(10, 10, 35);
-  const uint16_t DAWN   = tft.color565(255, 150, 90);
-  const uint16_t DAY    = tft.color565(100, 180, 255);
-  const uint16_t DUSK   = tft.color565(255, 110, 60);
-
-  // Minecraft ticks: 0 = sunrise, 6000 = noon, 12000 = sunset, 18000 = midnight
-  if (ticks < 1000) return lerpColor(DAWN, DAY, ticks / 1000.0f);
-  if (ticks < 11000) return DAY;
-  if (ticks < 13000) return lerpColor(DAY, DUSK, (ticks - 11000) / 2000.0f);
-  if (ticks < 14000) return lerpColor(DUSK, NIGHT, (ticks - 13000) / 1000.0f);
-  if (ticks < 22000) return NIGHT;
-  if (ticks < 23000) return lerpColor(NIGHT, DAWN, (ticks - 22000) / 1000.0f);
-  return DAWN;
-}
 
 // ---- networking -------------------------------------------------------
 
@@ -108,60 +78,57 @@ bool fetchTicks(uint32_t &outTicks) {
 }
 
 // ---- drawing -------------------------------------------------------
+//
+// Recreates the vanilla clock item's animation: a gold pocket-watch case
+// with a cream face and a single black hand that sweeps one full turn per
+// Minecraft day (24000 ticks). Colours/geometry are an original
+// from-scratch recreation, not extracted game assets.
 
-// Draws a simple sun disc with rays radiating outward at (x, y).
-void drawSun(int x, int y, uint16_t color) {
-  frame.fillCircle(x, y, BODY_RADIUS, color);
-  for (int i = 0; i < 8; i++) {
-    float a = i * (PI / 4.0f);
-    int x1 = x + cosf(a) * (BODY_RADIUS + 3);
-    int y1 = y + sinf(a) * (BODY_RADIUS + 3);
-    int x2 = x + cosf(a) * (BODY_RADIUS + 8);
-    int y2 = y + sinf(a) * (BODY_RADIUS + 8);
-    frame.drawLine(x1, y1, x2, y2, color);
-  }
-}
-
-// Draws a crescent-ish moon: light disc with a shadow circle offset to
-// bite a chunk out of it, same trick real MC clock textures use.
-void drawMoon(int x, int y, uint16_t color, uint16_t shadowColor) {
-  frame.fillCircle(x, y, BODY_RADIUS, color);
-  frame.fillCircle(x + BODY_RADIUS / 2, y - BODY_RADIUS / 3, BODY_RADIUS - 2, shadowColor);
-}
+static const uint16_t GOLD_LIGHT = 0xFE60; // tft.color565(255, 204, 0)-ish, precomputed for speed
+static const uint16_t GOLD_DARK  = 0x9AC0; // deeper gold for the bezel's outer edge/shadow
+static const uint16_t FACE_CREAM = 0xF7BC; // warm off-white dial face
+static const uint16_t HAND_BLACK = 0x0000;
 
 enum class ClockStatus { LIVE, OFFLINE, DEMO };
 
 void drawClockFace(uint32_t ticks, ClockStatus status) {
-  uint16_t sky = skyColorForTicks(ticks);
-  frame.fillSprite(sky);
+  frame.fillSprite(TFT_BLACK);
 
-  // Outer bezel
-  frame.drawSmoothCircle(CENTER, CENTER, DIAL_RADIUS + 14, TFT_DARKGREY, sky);
-  frame.drawSmoothCircle(CENTER, CENTER, DIAL_RADIUS + 10, TFT_BLACK, sky);
+  // Gold case: two concentric rings (outer = darker gold shadow edge, inner
+  // = brighter gold face of the bezel), then the cream dial on top.
+  frame.fillSmoothCircle(CENTER, CENTER, DIAL_RADIUS + 16, GOLD_DARK);
+  frame.fillSmoothCircle(CENTER, CENTER, DIAL_RADIUS + 11, GOLD_LIGHT);
+  frame.fillSmoothCircle(CENTER, CENTER, DIAL_RADIUS + 2, GOLD_DARK);
+  frame.fillSmoothCircle(CENTER, CENTER, DIAL_RADIUS, FACE_CREAM);
 
-  // Rotation: 0 ticks = sunrise (sun at east/right), matches vanilla clock
-  // orientation where the sun climbs from the horizon at tick 0.
-  float angleDeg = (ticks / (float)MC_TICKS_PER_DAY) * 360.0f;
-  float angleRad = radians(angleDeg - 90.0f); // -90 so tick 0 starts at top
-
-  int sunX = CENTER + cosf(angleRad) * DIAL_RADIUS;
-  int sunY = CENTER + sinf(angleRad) * DIAL_RADIUS;
-  int moonX = CENTER + cosf(angleRad + PI) * DIAL_RADIUS;
-  int moonY = CENTER + sinf(angleRad + PI) * DIAL_RADIUS;
-
-  // Faint dial line connecting sun/moon, like the compass needle in the item
-  frame.drawLine(sunX, sunY, moonX, moonY, TFT_DARKGREY);
-
-  bool isDay = ticks < 12000 || ticks > 23500;
-  // Draw whichever body is "behind" (closer to bottom / below horizon-ish)
-  // first so the visually "up" one draws on top when they'd overlap.
-  if (sunY > moonY) {
-    drawMoon(moonX, moonY, TFT_WHITE, sky);
-    drawSun(sunX, sunY, TFT_YELLOW);
-  } else {
-    drawSun(sunX, sunY, TFT_YELLOW);
-    drawMoon(moonX, moonY, TFT_WHITE, sky);
+  // 8 tick marks around the rim, like the notches on the real item texture.
+  for (int i = 0; i < 8; i++) {
+    float a = radians(i * 45.0f);
+    int x1 = CENTER + cosf(a) * (DIAL_RADIUS - 6);
+    int y1 = CENTER + sinf(a) * (DIAL_RADIUS - 6);
+    int x2 = CENTER + cosf(a) * (DIAL_RADIUS - 14);
+    int y2 = CENTER + sinf(a) * (DIAL_RADIUS - 14);
+    frame.drawWideLine(x1, y1, x2, y2, 3, GOLD_DARK);
   }
+
+  // The hand: tick 0 (sunrise) points straight up, sweeping clockwise
+  // through a full 360 deg over 24000 ticks, same period as the real item.
+  float angleRad = radians((ticks / (float)MC_TICKS_PER_DAY) * 360.0f - 90.0f);
+  int tipX = CENTER + cosf(angleRad) * (DIAL_RADIUS - 18);
+  int tipY = CENTER + sinf(angleRad) * (DIAL_RADIUS - 18);
+
+  // Taper the hand into a thin triangle instead of a uniform-width line,
+  // closer to the wedge-shaped hand on the actual texture.
+  float perpRad = angleRad + PI / 2.0f;
+  int baseHalfWidth = 5;
+  int bx1 = CENTER + cosf(perpRad) * baseHalfWidth;
+  int by1 = CENTER + sinf(perpRad) * baseHalfWidth;
+  int bx2 = CENTER - cosf(perpRad) * baseHalfWidth;
+  int by2 = CENTER - sinf(perpRad) * baseHalfWidth;
+  frame.fillTriangle(bx1, by1, bx2, by2, tipX, tipY, HAND_BLACK);
+
+  // Center hub
+  frame.fillSmoothCircle(CENTER, CENTER, 6, HAND_BLACK);
 
   // HUD text: HH:MM in-game time + connection dot
   uint32_t totalMinutes = (uint32_t)((ticks / (float)MC_TICKS_PER_DAY) * 24.0f * 60.0f);
@@ -174,19 +141,19 @@ void drawClockFace(uint32_t ticks, ClockStatus status) {
   snprintf(buf, sizeof(buf), "%02lu:%02lu", hh, mm);
 
   frame.setTextDatum(MC_DATUM);
-  frame.setTextColor(TFT_WHITE, sky);
+  frame.setTextColor(HAND_BLACK, FACE_CREAM);
   frame.drawString(buf, CENTER, CENTER + DIAL_RADIUS - 30, 4);
 
   uint16_t dotColor = TFT_RED;
-  if (status == ClockStatus::LIVE) dotColor = TFT_GREEN;
+  if (status == ClockStatus::LIVE) dotColor = TFT_DARKGREEN;
   else if (status == ClockStatus::DEMO) dotColor = TFT_ORANGE;
   frame.fillCircle(CENTER, CENTER + DIAL_RADIUS - 4, 4, dotColor);
 
   if (status == ClockStatus::DEMO) {
-    frame.setTextColor(TFT_ORANGE, sky);
+    frame.setTextColor(TFT_ORANGE, FACE_CREAM);
     frame.drawString("DEMO", CENTER, CENTER - DIAL_RADIUS + 22, 2);
   } else if (status == ClockStatus::OFFLINE) {
-    frame.setTextColor(TFT_RED, sky);
+    frame.setTextColor(TFT_RED, FACE_CREAM);
     frame.drawString("OFFLINE", CENTER, CENTER - DIAL_RADIUS + 22, 2);
   }
 

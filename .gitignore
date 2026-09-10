@@ -3,3 +3,4 @@
 src/secrets.h
 bridge/config.json
 __pycache__/
+.pio-cache/
