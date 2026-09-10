@@ -1,17 +1,14 @@
 # mc-clock-esp32
 
 ESP32 + 1.28" round GC9A01 TFT (240x240) displaying live Minecraft server
-time as the real vanilla clock item animation, edited down to just its
-moving part. This is designed to sit inside a 3D-printed shell that
-reproduces the item's gold coin casing - the screen only needs to show
-what actually animates. `tools/gen_clock_frames.py` takes the real
-`clock_00.png`..`clock_63.png` game textures, edits out the gold coin
-pixels, and fills the resulting gaps with the nearest surviving sky/sun/
-moon pixel so there's no rigid edge where the coin shell used to be -
-still the real, blocky/pixelated per-frame texture data, just extended
-to fill the whole screen instead of a small window. See "Isolated
-animation" below for the details, and "Asset provenance" before sharing
-this repo publicly.
+time, animated by continuously rotating the real pre-1.5 clock dial
+texture behind the screen - the same technique the original Minecraft
+clock item used before Java Edition 1.5 replaced it with a pre-rendered
+64-frame animation. This is designed to sit inside a 3D-printed shell
+that reproduces the item's gold coin casing, so the screen only needs to
+show what's visible through the case's window. See "Dial rendering"
+below for how it works, and "Asset provenance" before doing anything
+with the generated asset beyond personal use on your own device.
 
 ## Architecture
 
@@ -60,6 +57,8 @@ Exposes `GET http://<bridge-host>:5005/time` -> `{"ticks": 6123, "day": 4}`.
 
 - Edit `src/secrets.h` (copy from `src/secrets.h.example`) with your WiFi
   SSID/password and the bridge URL.
+- Generate `src/dial.h` (see "Dial rendering" below) — required, not
+  committed to this repo.
 - `pio run -t upload` (or open in PlatformIO IDE / VSCode extension).
 
 Uses the `TFT_eSPI` library with a GC9A01 driver profile — the custom
@@ -119,67 +118,69 @@ nothing about the display. If the screen stays blank after flashing:
    scrolling but the screen never changes, that confirms it's hardware
    (wiring/backlight/power), not code.
 
-## Isolated animation (for the 3D-printed shell build)
+## Dial rendering (for the 3D-printed shell build)
 
 The real clock item is a gold coin with a small lens-shaped window near
-the top showing a sliver of the sky/sun/moon animation - most of the
-item is static gold casing. If you're 3D-printing that gold casing as a
-physical shell around this screen, the screen only needs to show what's
-behind the window.
+the top showing a sliver of a rotating sky/sun/moon dial - most of the
+item is static gold casing. Since this screen sits behind a 3D-printed
+reproduction of that casing, the firmware only needs to render what's
+visible through the window - i.e. the whole screen is dial content, no
+casing to draw.
 
-**Current state (first pass):** `tools/gen_clock_frames.py` edits the
-real `clock_00.png`..`clock_63.png` textures by classifying every pixel
-as sky-blue, night-black, sun, moon, or gold coin shell, then deleting
-the gold shell pixels (and transparent corners) - everywhere the coin
-used to be is just black, keeping only the real sky/sun/moon pixels
-exactly as they are, no fill/extension yet. That's `src/clock_frames.h`,
-blitted nearest-neighbor scaled 16px -> 240px by `blitClockFrame()` in
-`src/main.cpp`.
+**This is a required local generation step, same as `src/secrets.h`.**
+`tools/gen_dial_asset.py` downloads the official Minecraft 1.4.7 client
+jar straight from Mojang's version manifest and extracts `misc/dial.png`
+- the actual dial texture the original (pre-1.5) clock item sampled,
+before Java Edition 1.5 replaced that system with the pre-rendered
+64-frame animation seen in modern versions. `renderDial()` in
+`src/main.cpp` is a C++ port of that original system's rotation math
+([reference](https://minecraft.wiki/w/Procedural_animated_texture_generation/Clocks)):
+for every screen pixel, rotate its centered (u, v) coordinate by
+`-dial_angle` and sample the dial texture at the rotated position,
+wrapping at its edges. `dial_angle = (ticks / 24000.0) * 2*PI`, i.e. one
+full continuous rotation per Minecraft day - not 64 discrete steps, so
+the sun/moon actually glide instead of jumping every 375 ticks.
 
-Classifying "is this pixel part of the window" by whether it changes
-across the 64 frames doesn't work - the gold shell has its own subtle
-per-frame shimmer/highlight shading unrelated to the sky animation, so
-that test lets gold pixels leak in as fake "window" content. Classifying
-by color shape instead (gold has a distinct r > g > b warm signature the
-sky/sun/moon colors never do) avoids that.
+Run the generator once before building:
 
-Filling in the black area to extend the sky/sun/moon out to the edges of
-the screen (instead of leaving it black) is the next pass, once this is
-confirmed looking right on real hardware.
+```
+pip install pillow requests
+python3 tools/gen_dial_asset.py
+```
 
 ## Asset provenance
 
-`src/clock_frames.h` is generated by `tools/gen_clock_frames.py`, which
-downloads the 64 vanilla `clock_NN.png` item textures (Mojang's own game
-assets) and bakes them into an RGB565 PROGMEM table. This is fine for a
-personal display device you built for yourself, same as running a
-resource/texture pack — but it's still Mojang's copyrighted artwork, not
-something this repo has any license to redistribute as a standalone asset.
-**Don't push this repo to a public remote with `clock_frames.h` included**
-if that's a concern; regenerate it locally instead (`python3
-tools/gen_clock_frames.py`, needs `pip install pillow requests`) and add
-it to `.gitignore` if you want to keep the repo itself asset-free.
+`src/dial.h` (generated by `tools/gen_dial_asset.py`) is Mojang's own
+`misc/dial.png` game asset, sourced directly from an official Mojang
+client jar. This is fine for a personal display device you built for
+yourself, same as running a resource/texture pack - but it's still
+Mojang's copyrighted artwork, not something this repo has any license to
+redistribute as a standalone asset. **`src/dial.h` is gitignored and was
+never committed to this repo** - you must run the generator yourself to
+produce it locally before building the firmware.
 
 ## Refresh rate
 
 The GC9A01 has no hardware refresh limit issue here — the actual bottleneck
 is SPI bandwidth: pushing a full 240x240x16bpp frame is 115200 bytes, which
 takes tens of ms even at 20-40MHz. The firmware avoids fighting that limit
-by only re-blitting and pushing a new frame when the visible clock frame
-(1 of 64) or connection status actually changes — not on every ~50ms loop
-tick — so it doesn't try to push more screens per second than the picture
-is actually changing. If you still want snappier visuals: try raising
-`SPI_FREQUENCY` back up in `src/User_Setup_GC9A01.h` once your wiring is
-confirmed solid (see Troubleshooting), or shorten `DEMO_CYCLE_SECONDS` if
-demo mode still feels choppy - a faster demo cycle changes frames faster,
-so pushes happen more often by design there.
+by only re-rendering and pushing a new frame once the dial has rotated
+past a minimum angle threshold (`MIN_REDRAW_ANGLE_STEP`, 0.5° by default)
+or connection status changes — not on every ~50ms loop tick — so it
+doesn't try to push more screens per second than the picture is actually
+changing. If you still want snappier visuals: try raising `SPI_FREQUENCY`
+back up in `src/User_Setup_GC9A01.h` once your wiring is confirmed solid
+(see Troubleshooting), or shorten `DEMO_CYCLE_SECONDS` if demo mode still
+feels choppy - a faster demo cycle rotates the dial faster, so pushes
+happen more often by design there.
 
 ## Notes
 
 - Minecraft day cycle is 24000 ticks; 0/24000 = sunrise, 6000 = noon,
   12000 = sunset, 18000 = midnight.
-- Dial angle = `(ticks / 24000.0) * 360`, sun and moon are drawn 180°
-  apart on that dial, sky color interpolates day/dusk/night/dawn bands.
+- Dial angle = `(ticks / 24000.0) * 2*PI`, sampled continuously against
+  the real dial texture (see "Dial rendering") rather than drawn from
+  scratch - sun/moon placement and sky shading come from that texture.
 - If your MC server doesn't have RCON enabled: set `enable-rcon=true`,
   `rcon.password=...`, `rcon.port=25575` in `server.properties` and restart.
   For this homelab's server (`itzg/minecraft-server` in the `minecraft` LXC,

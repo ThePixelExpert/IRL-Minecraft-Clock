@@ -6,24 +6,10 @@
 #include <math.h>
 
 #include "secrets.h"
-#include "clock_frames.h"
+#include "dial.h"
 
 static const uint16_t SCREEN_SIZE = 240;
 static const uint16_t CENTER = SCREEN_SIZE / 2;
-static const uint16_t SRC_SIZE = 16;   // edited clock texture is 16x16
-
-// The real sky/sun/moon content only ever occupies this bounding box
-// within the 16x16 texture (rows 2-8, cols 3-12 - verified by checking
-// every frame; everything outside it is coin shell, now black). Crop to
-// just that box and stretch it to fill the whole screen instead of
-// upscaling the full 16x16 canvas uniformly, which would leave the real
-// content as a small patch surrounded by a black margin.
-static const uint16_t CROP_ROW_START = 2;
-static const uint16_t CROP_ROW_END   = 9;  // exclusive
-static const uint16_t CROP_COL_START = 3;
-static const uint16_t CROP_COL_END   = 13; // exclusive
-static const uint16_t CROP_H = CROP_ROW_END - CROP_ROW_START;
-static const uint16_t CROP_W = CROP_COL_END - CROP_COL_START;
 static const uint32_t POLL_INTERVAL_MS = 3000;
 static const uint32_t MC_TICKS_PER_DAY = 24000;
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
@@ -96,68 +82,71 @@ bool fetchTicks(uint32_t &outTicks) {
 // ---- drawing -------------------------------------------------------
 //
 // This screen sits behind a 3D-printed gold shell that reproduces the
-// coin/case part of the vanilla clock item - so the firmware only needs
-// to draw the part of the item that actually animates. clock_frames.h
-// (built by tools/gen_clock_frames.py) is the REAL clock_00.png..
-// clock_63.png pixel data with the gold coin shell edited out and the
-// resulting gaps filled in with the nearest surviving sky/sun/moon pixel
-// - deliberately blocky/pixelated like the source sprite, not smoothed,
-// so there's no rigid edge where the coin shell used to be. This just
-// blits that real edited bitmap, nearest-neighbor scaled 16px -> 240px.
+// coin/case part of the vanilla clock item, so the firmware only needs
+// to render the part that actually animates - the physical shell is
+// the "coin shell", the whole screen is the "window". dial.h (built by
+// tools/gen_dial_asset.py from the REAL pre-1.5 misc/dial.png) is that
+// same rotating dial texture the original clock item sampled, before
+// Minecraft 1.5 replaced it with a pre-rendered 64-frame animation. We
+// use the original approach instead of the modern one specifically
+// because it rotates continuously rather than stepping through 64 fixed
+// positions - see
+// https://minecraft.wiki/w/Procedural_animated_texture_generation/Clocks
+//
+// Algorithm (ported from that page's setup_clock_sprite pseudocode):
+// for each output pixel, take its position centered on the screen as a
+// (u, v) pair in [-0.5, 0.5], rotate that coordinate by -dial_angle, and
+// sample dial.h at the rotated position (wrapping around its edges).
+// The item-mask/fuchsia-multiply step in the original isn't needed here
+// since every screen pixel is "window" - there's no static coin shell
+// to draw around it, that's the real 3D-printed part.
 
 enum class ClockStatus { LIVE, OFFLINE, DEMO };
 
-// Redraw caching: the texture only has 64 visual states (one every 375
-// ticks), so there's no reason to re-blit and re-push a full 240x240
-// frame on every ~50ms loop tick just because currentTicks incremented
-// by a handful. Skipping unchanged frames is what actually fixes
-// sluggish/torn refresh - the SPI bus was being asked to push complete
-// screens far more often than the picture was actually changing.
-uint8_t lastDrawnFrame = 255;
+// Redraw throttling: dial_angle is now continuous, so "did anything
+// change" can't be an equality check like the old discrete frame index
+// was. At real MC speed (20 real minutes/day = ~0.3 deg/sec) a redraw
+// every loop tick would be imperceptibly finer than this threshold and
+// just re-triggers the exact SPI bottleneck the old frame-skip logic
+// was written to avoid. Redraw once the dial has actually turned far
+// enough to look different.
+static const float MIN_REDRAW_ANGLE_STEP = 0.5f * DEG_TO_RAD;
+float lastDrawnAngle = -1000.0f; // sentinel guarantees the first call always draws
 ClockStatus lastDrawnStatus = static_cast<ClockStatus>(-1);
 
-// Frame 0 in the vanilla set is solar noon (sun centered, symmetric day
-// sky); frame 32 is midnight (full moon sky); the set advances one frame
-// per 375 ticks (24000 ticks / 64 frames). Shift by 18000 ticks so our
-// tick-0-is-sunrise convention lands on the correct vanilla frame.
-uint8_t frameIndexForTicks(uint32_t ticks) {
-  uint32_t shifted = (ticks + 18000UL) % MC_TICKS_PER_DAY;
-  return (uint8_t)((shifted * CLOCK_FRAME_COUNT) / MC_TICKS_PER_DAY) % CLOCK_FRAME_COUNT;
+float angularDelta(float a, float b) {
+  float d = fmodf(a - b + PI, 2.0f * PI);
+  if (d < 0) d += 2.0f * PI;
+  return fabsf(d - PI);
 }
 
-void blitClockFrame(uint8_t frameIndex) {
-  // One uniform scale factor for both axes (preserves the source's
-  // aspect ratio - no stretching), picked large enough that the scaled
-  // content fully covers the square screen. Since CROP_W (10) > CROP_H
-  // (7), that means the width doesn't fully fit; centered horizontally,
-  // some of the leftmost/rightmost sky is simply off-screen, which is
-  // fine - better than distorting the shape.
-  float scale = max((float)SCREEN_SIZE / CROP_W, (float)SCREEN_SIZE / CROP_H);
-  float usedSrcSize = SCREEN_SIZE / scale;         // source units actually visible on screen (same for both axes)
-  float srcOriginX = CROP_COL_START + (CROP_W - usedSrcSize) / 2.0f;
-  float srcOriginY = CROP_ROW_START + (CROP_H - usedSrcSize) / 2.0f;
-
+void renderDial(float dialAngle) {
+  float rx = sinf(-dialAngle);
+  float ry = cosf(-dialAngle);
   for (uint16_t y = 0; y < SCREEN_SIZE; y++) {
-    uint16_t srcY = (uint16_t)(srcOriginY + (y / (float)SCREEN_SIZE) * usedSrcSize);
-    const uint16_t srcRowBase = srcY * SRC_SIZE;
+    float v = y / (float)(SCREEN_SIZE - 1) - 0.5f;
     for (uint16_t x = 0; x < SCREEN_SIZE; x++) {
-      uint16_t srcX = (uint16_t)(srcOriginX + (x / (float)SCREEN_SIZE) * usedSrcSize);
-      uint16_t color = pgm_read_word(&clockFrames[frameIndex][srcRowBase + srcX]);
+      float u = -(x / (float)(SCREEN_SIZE - 1) - 0.5f);
+      int32_t dx = (int32_t)((u * ry + v * rx + 0.5f) * DIAL_WIDTH)  % DIAL_WIDTH;
+      int32_t dy = (int32_t)((v * ry - u * rx + 0.5f) * DIAL_HEIGHT) % DIAL_HEIGHT;
+      if (dx < 0) dx += DIAL_WIDTH;
+      if (dy < 0) dy += DIAL_HEIGHT;
+      uint16_t color = pgm_read_word(&dial[dy * DIAL_WIDTH + dx]);
       canvas->drawPixel(x, y, color);
     }
   }
 }
 
 void drawClockFace(uint32_t ticks, ClockStatus status) {
-  uint8_t frameIndex = frameIndexForTicks(ticks);
+  float dialAngle = (ticks / (float)MC_TICKS_PER_DAY) * 2.0f * PI;
 
-  if (frameIndex == lastDrawnFrame && status == lastDrawnStatus) {
+  if (angularDelta(dialAngle, lastDrawnAngle) < MIN_REDRAW_ANGLE_STEP && status == lastDrawnStatus) {
     return; // nothing a viewer would actually see has changed - skip the SPI push
   }
-  lastDrawnFrame = frameIndex;
+  lastDrawnAngle = dialAngle;
   lastDrawnStatus = status;
 
-  blitClockFrame(frameIndex);
+  renderDial(dialAngle);
 
   uint32_t totalMinutes = (uint32_t)((ticks / (float)MC_TICKS_PER_DAY) * 24.0f * 60.0f);
   totalMinutes = (totalMinutes + 6 * 60) % (24 * 60); // MC day starts at 06:00 clock-equivalent
