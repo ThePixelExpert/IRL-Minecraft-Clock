@@ -21,10 +21,28 @@ static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static const uint32_t DEMO_CYCLE_SECONDS = 60; // one full simulated MC day per this many real seconds
 static const uint32_t DEMO_TICKS_PER_LOOP = (MC_TICKS_PER_DAY * 50) / (DEMO_CYCLE_SECONDS * 1000);
 
+static const uint16_t HALF_HEIGHT = SCREEN_SIZE / 2;
+
 TFT_eSPI tft = TFT_eSPI();
-TFT_eSprite frame = TFT_eSprite(&tft);
-TFT_eSPI* canvas = &tft;   // points at frame once the sprite buffer allocates
-bool spriteReady = false;  // draw calls silently no-op on an un-created sprite
+// One 240x240x16bpp sprite (115200 bytes) doesn't reliably fit: the ESP32's
+// classic (non-PSRAM) DRAM heap has plenty of *free* memory but is split
+// into fragmented regions, so the largest single allocatable block can be
+// well under total free heap (measured ~110KB block with ~298KB free on
+// this board). Splitting the double-buffer into top/bottom halves (57600
+// bytes each) keeps every allocation comfortably under that ceiling while
+// still avoiding full-frame tearing.
+TFT_eSprite frameTop = TFT_eSprite(&tft);
+TFT_eSprite frameBottom = TFT_eSprite(&tft);
+bool spriteReady = false;  // draw calls fall back straight to tft when false
+
+// Which surface (and locally-adjusted y) a given screen row belongs to.
+TFT_eSPI* surfaceFor(uint16_t y) {
+  if (!spriteReady) return &tft;
+  return (y < HALF_HEIGHT) ? (TFT_eSPI*)&frameTop : (TFT_eSPI*)&frameBottom;
+}
+uint16_t localY(uint16_t y) {
+  return (!spriteReady || y < HALF_HEIGHT) ? y : (uint16_t)(y - HALF_HEIGHT);
+}
 
 uint32_t lastPollMs = 0;
 uint32_t currentTicks = 0;      // 0..23999, last known-good value from bridge (or simulated in demo mode)
@@ -125,6 +143,8 @@ void renderDial(float dialAngle) {
   float ry = cosf(-dialAngle);
   for (uint16_t y = 0; y < SCREEN_SIZE; y++) {
     float v = y / (float)(SCREEN_SIZE - 1) - 0.5f;
+    TFT_eSPI* surface = surfaceFor(y);
+    uint16_t ly = localY(y);
     for (uint16_t x = 0; x < SCREEN_SIZE; x++) {
       float u = -(x / (float)(SCREEN_SIZE - 1) - 0.5f);
       int32_t dx = (int32_t)((u * ry + v * rx + 0.5f) * DIAL_WIDTH)  % DIAL_WIDTH;
@@ -132,7 +152,7 @@ void renderDial(float dialAngle) {
       if (dx < 0) dx += DIAL_WIDTH;
       if (dy < 0) dy += DIAL_HEIGHT;
       uint16_t color = pgm_read_word(&dial[dy * DIAL_WIDTH + dx]);
-      canvas->drawPixel(x, y, color);
+      surface->drawPixel(x, ly, color);
     }
   }
 }
@@ -157,28 +177,38 @@ void drawClockFace(uint32_t ticks, ClockStatus status) {
 
   // The extended-fill area near the bottom edge is always a flat sky
   // color (blue or black; the disc never reaches down this far), so
-  // plain white text reads fine here regardless of time of day.
-  canvas->setTextDatum(MC_DATUM);
-  canvas->setTextColor(TFT_WHITE);
-  canvas->drawString(buf, CENTER, SCREEN_SIZE - 20, 4);
+  // plain white text reads fine here regardless of time of day. Neither
+  // this text nor the status dot/label below ever crosses the
+  // top/bottom sprite split (y=HALF_HEIGHT), so each just draws to
+  // whichever single surface owns its y.
+  const uint16_t TEXT_Y = SCREEN_SIZE - 20;
+  TFT_eSPI* textSurface = surfaceFor(TEXT_Y);
+  textSurface->setTextDatum(MC_DATUM);
+  textSurface->setTextColor(TFT_WHITE);
+  textSurface->drawString(buf, CENTER, localY(TEXT_Y), 4);
 
+  const uint16_t DOT_Y = 20;
+  TFT_eSPI* dotSurface = surfaceFor(DOT_Y);
   uint16_t dotColor = TFT_RED;
   if (status == ClockStatus::LIVE) dotColor = TFT_GREEN;
   else if (status == ClockStatus::DEMO) dotColor = TFT_ORANGE;
-  canvas->fillCircle(SCREEN_SIZE - 20, 20, 5, dotColor);
+  dotSurface->fillCircle(SCREEN_SIZE - 20, localY(DOT_Y), 5, dotColor);
 
   if (status == ClockStatus::DEMO) {
-    canvas->setTextColor(TFT_ORANGE);
-    canvas->drawString("DEMO", CENTER, 20, 2);
+    dotSurface->setTextColor(TFT_ORANGE);
+    dotSurface->drawString("DEMO", CENTER, localY(DOT_Y), 2);
   } else if (status == ClockStatus::OFFLINE) {
-    canvas->setTextColor(TFT_RED);
-    canvas->drawString("OFFLINE", CENTER, 20, 2);
+    dotSurface->setTextColor(TFT_RED);
+    dotSurface->drawString("OFFLINE", CENTER, localY(DOT_Y), 2);
   }
 
   // pushSprite is only meaningful when we're actually drawing into the
-  // off-screen sprite; if allocation failed, canvas points straight at
-  // tft and every draw call above already landed on the real screen.
-  if (spriteReady) frame.pushSprite(0, 0);
+  // off-screen sprites; if allocation failed, every draw call above
+  // already landed straight on the real screen via tft.
+  if (spriteReady) {
+    frameTop.pushSprite(0, 0);
+    frameBottom.pushSprite(0, HALF_HEIGHT);
+  }
 }
 
 // ---- main -------------------------------------------------------
@@ -196,16 +226,21 @@ void setup() {
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawString("Connecting...", CENTER, CENTER, 4);
 
-  frame.setColorDepth(16);
-  void* spriteBuf = frame.createSprite(SCREEN_SIZE, SCREEN_SIZE);
-  if (spriteBuf != nullptr) {
-    canvas = &frame;
+  frameTop.setColorDepth(16);
+  frameBottom.setColorDepth(16);
+  Serial.printf("Heap before sprites: free=%u largestBlock=%u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  void* topBuf = frameTop.createSprite(SCREEN_SIZE, HALF_HEIGHT);
+  void* bottomBuf = topBuf ? frameBottom.createSprite(SCREEN_SIZE, HALF_HEIGHT) : nullptr;
+  if (topBuf != nullptr && bottomBuf != nullptr) {
     spriteReady = true;
-    Serial.println("Sprite allocated OK, drawing double-buffered");
+    Serial.println("Sprites allocated OK, drawing double-buffered (split top/bottom)");
   } else {
-    // Out of heap for a 240x240x16bpp (115200 byte) buffer - fall back to
-    // drawing straight to the panel. Every drawClockFace() call below
-    // still works, it just isn't double-buffered (may flicker slightly).
+    // Either half failed - most likely still heap fragmentation, just
+    // less of it than the old single full-screen sprite needed. Fall
+    // back to drawing straight to the panel; every drawClockFace() call
+    // below still works, it just isn't double-buffered (may flicker
+    // slightly). Free whichever half did succeed so it isn't leaked.
+    if (topBuf) frameTop.deleteSprite();
     Serial.println("WARNING: sprite allocation FAILED, drawing directly to TFT");
   }
 
