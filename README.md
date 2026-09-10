@@ -138,12 +138,31 @@ the two poles. Colors (sky blue, night black, sun yellow, moon gray/blue
 plus its highlight) are sampled directly from real pixels in
 `clock_00.png` and `clock_32.png`, not guessed.
 
-If you'd rather show the literal 64-frame texture pixel-for-pixel
-instead (e.g. no 3D-printed shell, screen shows the whole coin including
-gold casing), the `tools/gen_clock_frames.py` -> `src/clock_frames.h`
-texture-blit approach from an earlier version of this firmware still
-works for that - it's kept in the repo, just not wired into `main.cpp`
-anymore.
+**The rotation angle itself is extracted from the real frames too, not a
+linear formula.** `tools/gen_clock_frames.py` classifies every pixel in
+each of the 64 frames (sun/moon/day-blue/night-black vs. the gold shell,
+including the shell's own subtle per-frame shimmer, which had to be
+told apart from real sky colors by hue shape rather than "does it change
+between frames" - it does, and that's not the same thing as being part of
+the animation) and takes the sun's (or moon's) pixel centroid angle
+relative to the window's center. That gives 64 real angles - but a 16x16
+sprite only has a handful of sun/moon pixels to centroid (as few as 1-2
+near sunrise/sunset), so the raw extraction is noisy and briefly dips
+backwards frame to frame. The script clips that to monotonic and blends
+it 50/50 with a perfectly even 360/64-degree progression before baking
+it into `src/clock_angles.h` - real extracted motion data, smoothed just
+enough to read as fluid instead of jittery on a screen 15x bigger than
+the source sprite.
+
+An earlier version of this firmware instead tried isolating the raw
+per-frame *pixels* (masking out the gold shell, flood-filling the gaps
+with the nearest surviving sky color) and blitting that bitmap directly.
+It looked wrong: a fixed dark "shadow" pixel band under the sun/moon
+disc - present in the source texture in every frame, not really part of
+day/night at all - flood-filled into a big blocky rectangle when
+extended out to fill the whole screen. Extracting just the angle and
+re-rendering procedurally avoids that while still being driven by real
+per-frame game data for the motion.
 
 ## Asset provenance
 

@@ -6,6 +6,7 @@
 #include <math.h>
 
 #include "secrets.h"
+#include "clock_angles.h"
 
 static const uint16_t SCREEN_SIZE = 240;
 static const uint16_t CENTER = SCREEN_SIZE / 2;
@@ -111,7 +112,6 @@ enum class ClockStatus { LIVE, OFFLINE, DEMO };
 // loop tick. That's what actually fixes sluggish/torn refresh - the SPI
 // bus was being asked to push full 240x240 screens far more often than
 // the animation was actually advancing.
-static const uint32_t ANIMATION_STEPS = 64;
 uint8_t lastDrawnStep = 255;
 ClockStatus lastDrawnStatus = static_cast<ClockStatus>(-1);
 
@@ -120,7 +120,7 @@ ClockStatus lastDrawnStatus = static_cast<ClockStatus>(-1);
 // derived from the real texture frames (tick 0 is sunrise).
 uint8_t animationStepForTicks(uint32_t ticks) {
   uint32_t shifted = (ticks + 18000UL) % MC_TICKS_PER_DAY;
-  return (uint8_t)((shifted * ANIMATION_STEPS) / MC_TICKS_PER_DAY) % ANIMATION_STEPS;
+  return (uint8_t)((shifted * CLOCK_ANGLE_STEPS) / MC_TICKS_PER_DAY) % CLOCK_ANGLE_STEPS;
 }
 
 void drawClockFace(uint32_t ticks, ClockStatus status) {
@@ -132,8 +132,12 @@ void drawClockFace(uint32_t ticks, ClockStatus status) {
   lastDrawnStep = step;
   lastDrawnStatus = status;
 
-  // Sun pole angle: step 0 points straight up (screen-space -90 deg).
-  float sunAngleRad = radians((step * 360.0f / ANIMATION_STEPS) - 90.0f);
+  // Sun pole angle: looked up from the REAL per-frame angle extracted
+  // from clock_00.png..clock_63.png (tools/gen_clock_frames.py), not a
+  // pure linear formula - captures whatever actual (slightly uneven)
+  // motion the vanilla animation has, smoothed just enough to stay fluid
+  // rather than reproducing the raw extraction's pixel-centroid jitter.
+  float sunAngleRad = radians(clockAngleTenthsDeg[step] / 10.0f);
   float sunDirX = cosf(sunAngleRad);
   float sunDirY = sinf(sunAngleRad);
 
