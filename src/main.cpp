@@ -6,12 +6,9 @@
 #include <math.h>
 
 #include "secrets.h"
-#include "clock_frames.h"
 
 static const uint16_t SCREEN_SIZE = 240;
 static const uint16_t CENTER = SCREEN_SIZE / 2;
-static const uint16_t SRC_SIZE = 16;                     // vanilla clock texture is 16x16
-static const uint16_t SCALE = SCREEN_SIZE / SRC_SIZE;     // nearest-neighbor upscale factor (15x)
 static const uint32_t POLL_INTERVAL_MS = 3000;
 static const uint32_t MC_TICKS_PER_DAY = 24000;
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
@@ -83,82 +80,110 @@ bool fetchTicks(uint32_t &outTicks) {
 
 // ---- drawing -------------------------------------------------------
 //
-// Blits the real vanilla clock item texture (clock_00.png..clock_63.png,
-// baked into clock_frames.h by tools/gen_clock_frames.py) scaled up 15x
-// (16px -> 240px) with nearest-neighbor sampling, so the round screen
-// shows the exact in-game clock face pixel-for-pixel, just bigger.
+// This screen sits behind a 3D-printed gold shell that reproduces the
+// coin/case part of the vanilla clock item - so the firmware only needs
+// to draw the part of the item that actually animates: the little sky
+// window with the sun/moon. In the real 16x16 texture that's a small
+// lens-shaped cutout showing a sliver of a hidden rotating day/night
+// wheel (colors sampled directly from clock_00.png/clock_32.png via
+// tools/gen_clock_frames.py - see README's "Isolated animation" section
+// for how that was reverse-engineered from the raw frames). Since the
+// screen is the *entire* visible circle now (no coin around it), that
+// hidden wheel is reconstructed here in full instead of glimpsed through
+// a narrow slot: a straight day/night terminator through the center,
+// rotating once per Minecraft day, with the sun riding the day pole and
+// the moon riding the night pole 180 deg opposite it.
 
-// Frame 0 in the vanilla set is solar noon (sun centered, symmetric day
-// sky); frame 32 is midnight (full moon sky); the set advances one frame
-// per 375 ticks (24000 ticks / 64 frames). Shift by 18000 ticks so our
-// tick-0-is-sunrise convention lands on the correct vanilla frame.
-uint8_t frameIndexForTicks(uint32_t ticks) {
-  uint32_t shifted = (ticks + 18000UL) % MC_TICKS_PER_DAY;
-  return (uint8_t)((shifted * CLOCK_FRAME_COUNT) / MC_TICKS_PER_DAY) % CLOCK_FRAME_COUNT;
-}
+static const uint16_t SKY_DAY     = 0x3A95; // rgb(58,83,172)   - clock_00.png day sky
+static const uint16_t SKY_NIGHT   = 0x18A2; // rgb(24,22,22)    - clock_32.png night sky
+static const uint16_t SUN_COLOR   = 0xFFE0; // rgb(255,255,0)   - clock_00.png sun disc
+static const uint16_t MOON_BASE   = 0x52AD; // rgb(86,86,109)   - clock_32.png moon disc
+static const uint16_t MOON_HILITE = 0x6B71; // rgb(108,108,137) - clock_32.png moon highlight
 
-void blitClockFrame(uint8_t frameIndex) {
-  for (uint16_t y = 0; y < SCREEN_SIZE; y++) {
-    uint16_t srcY = y / SCALE;
-    const uint16_t srcRowBase = srcY * SRC_SIZE;
-    for (uint16_t x = 0; x < SCREEN_SIZE; x++) {
-      uint16_t srcX = x / SCALE;
-      uint16_t color = pgm_read_word(&clockFrames[frameIndex][srcRowBase + srcX]);
-      canvas->drawPixel(x, y, color);
-    }
-  }
-}
+static const int16_t POLE_DISTANCE = 50; // how far the sun/moon centers sit from screen center
+static const int16_t DISC_RADIUS   = 38; // sun/moon disc size (max reach 88px keeps clear of the HUD text/dot at +-100px)
 
 enum class ClockStatus { LIVE, OFFLINE, DEMO };
 
-// Redraw caching: the texture only has 64 visual states (one every 375
-// ticks), so there's no reason to re-blit and re-push a full 240x240
-// frame on every ~50ms loop tick just because currentTicks incremented by
-// a handful. Skipping unchanged frames is what actually fixes the
-// sluggish/torn refresh - the SPI bus was being asked to push complete
-// screens far more often than the picture was actually changing. The
-// HH:MM overlay is therefore only as fresh as the last frame change too
-// (~18s worst case in live mode) - fine for a clock whose real feature is
-// the animated dial, not second-accurate digits.
-uint8_t lastDrawnFrame = 255;
+// Redraw caching: quantize rotation to the same 64 steps the vanilla
+// texture used (24000 ticks / 64 = 375 ticks per step) so we redraw only
+// when the picture would actually visibly change, not on every ~50ms
+// loop tick. That's what actually fixes sluggish/torn refresh - the SPI
+// bus was being asked to push full 240x240 screens far more often than
+// the animation was actually advancing.
+static const uint32_t ANIMATION_STEPS = 64;
+uint8_t lastDrawnStep = 255;
 ClockStatus lastDrawnStatus = static_cast<ClockStatus>(-1);
 
-void drawClockFace(uint32_t ticks, ClockStatus status) {
-  uint8_t frameIndex = frameIndexForTicks(ticks);
+// Step 0 = solar noon (sun straight up, symmetric day), step 32 =
+// midnight (moon straight up, symmetric night) - same phase convention
+// derived from the real texture frames (tick 0 is sunrise).
+uint8_t animationStepForTicks(uint32_t ticks) {
+  uint32_t shifted = (ticks + 18000UL) % MC_TICKS_PER_DAY;
+  return (uint8_t)((shifted * ANIMATION_STEPS) / MC_TICKS_PER_DAY) % ANIMATION_STEPS;
+}
 
-  if (frameIndex == lastDrawnFrame && status == lastDrawnStatus) {
+void drawClockFace(uint32_t ticks, ClockStatus status) {
+  uint8_t step = animationStepForTicks(ticks);
+
+  if (step == lastDrawnStep && status == lastDrawnStatus) {
     return; // nothing a viewer would actually see has changed - skip the SPI push
   }
-  lastDrawnFrame = frameIndex;
+  lastDrawnStep = step;
   lastDrawnStatus = status;
 
-  blitClockFrame(frameIndex);
+  // Sun pole angle: step 0 points straight up (screen-space -90 deg).
+  float sunAngleRad = radians((step * 360.0f / ANIMATION_STEPS) - 90.0f);
+  float sunDirX = cosf(sunAngleRad);
+  float sunDirY = sinf(sunAngleRad);
+
+  // Per-pixel day/night split: a pixel is on the sun's half of the circle
+  // if its direction from center has a positive dot product with the sun
+  // direction - a hard-edged line through the center, perpendicular to
+  // the sun/moon axis, rotating together with them.
+  for (int16_t y = 0; y < SCREEN_SIZE; y++) {
+    int16_t dy = y - CENTER;
+    for (int16_t x = 0; x < SCREEN_SIZE; x++) {
+      int16_t dx = x - CENTER;
+      float dot = dx * sunDirX + dy * sunDirY;
+      canvas->drawPixel(x, y, dot >= 0 ? SKY_DAY : SKY_NIGHT);
+    }
+  }
+
+  int16_t sunX = CENTER + (int16_t)(sunDirX * POLE_DISTANCE);
+  int16_t sunY = CENTER + (int16_t)(sunDirY * POLE_DISTANCE);
+  int16_t moonX = CENTER - (int16_t)(sunDirX * POLE_DISTANCE);
+  int16_t moonY = CENTER - (int16_t)(sunDirY * POLE_DISTANCE);
+
+  canvas->fillCircle(sunX, sunY, DISC_RADIUS, SUN_COLOR);
+
+  canvas->fillCircle(moonX, moonY, DISC_RADIUS, MOON_BASE);
+  // Small offset highlight so the moon doesn't read as a flat gray dot -
+  // matches the lighter patch visible in the real clock_32.png moon.
+  canvas->fillCircle(moonX - DISC_RADIUS / 3, moonY - DISC_RADIUS / 3, DISC_RADIUS / 2, MOON_HILITE);
 
   uint32_t totalMinutes = (uint32_t)((ticks / (float)MC_TICKS_PER_DAY) * 24.0f * 60.0f);
   totalMinutes = (totalMinutes + 6 * 60) % (24 * 60); // MC day starts at 06:00 clock-equivalent
-
   uint32_t hh = totalMinutes / 60;
   uint32_t mm = totalMinutes % 60;
   char buf[8];
   snprintf(buf, sizeof(buf), "%02lu:%02lu", hh, mm);
 
-  // Bottom third of the coin texture is flat gold in every frame - safe
-  // spot for the HUD without fighting the sun/moon artwork.
   canvas->setTextDatum(MC_DATUM);
-  canvas->setTextColor(TFT_BLACK); // no bg arg = transparent draw, doesn't stomp the coin art
-  canvas->drawString(buf, CENTER, 195, 4);
+  canvas->setTextColor(TFT_WHITE);
+  canvas->drawString(buf, CENTER, SCREEN_SIZE - 20, 4);
 
   uint16_t dotColor = TFT_RED;
-  if (status == ClockStatus::LIVE) dotColor = TFT_DARKGREEN;
+  if (status == ClockStatus::LIVE) dotColor = TFT_GREEN;
   else if (status == ClockStatus::DEMO) dotColor = TFT_ORANGE;
-  canvas->fillCircle(CENTER, 218, 4, dotColor);
+  canvas->fillCircle(SCREEN_SIZE - 20, 20, 5, dotColor);
 
   if (status == ClockStatus::DEMO) {
     canvas->setTextColor(TFT_ORANGE);
-    canvas->drawString("DEMO", CENTER, 30, 2);
+    canvas->drawString("DEMO", CENTER, 20, 2);
   } else if (status == ClockStatus::OFFLINE) {
     canvas->setTextColor(TFT_RED);
-    canvas->drawString("OFFLINE", CENTER, 30, 2);
+    canvas->drawString("OFFLINE", CENTER, 20, 2);
   }
 
   // pushSprite is only meaningful when we're actually drawing into the

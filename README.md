@@ -1,12 +1,13 @@
 # mc-clock-esp32
 
 ESP32 + 1.28" round GC9A01 TFT (240x240) displaying live Minecraft server
-time as the actual vanilla clock item animation: the real 64-frame
-`clock_00.png`..`clock_63.png` game textures, baked into firmware and
-blitted pixel-for-pixel (nearest-neighbor scaled 16px -> 240px) so the
-screen shows exactly what the in-game item looks like at that time of
-day, just much bigger. See "Asset provenance" below before sharing this
-repo publicly.
+time as an isolated recreation of the vanilla clock item's animated part
+only. This is designed to sit inside a 3D-printed shell that reproduces
+the item's gold coin casing - the screen only needs to show what actually
+moves: a day/night sky with the sun or moon, extrapolated from the real
+game texture's tiny sky window to fill the whole round screen. See
+"Isolated animation" below for how the geometry was derived, and "Asset
+provenance" before sharing this repo publicly.
 
 ## Architecture
 
@@ -113,6 +114,36 @@ nothing about the display. If the screen stays blank after flashing:
    they're doing. If you see `display_test: RED` / `GREEN` / `BLUE`
    scrolling but the screen never changes, that confirms it's hardware
    (wiring/backlight/power), not code.
+
+## Isolated animation (for the 3D-printed shell build)
+
+The real clock item is a gold coin with a small lens-shaped window near
+the top showing a sliver of a hidden rotating day/night wheel - most of
+the item is static gold casing. If you're 3D-printing that gold casing as
+a physical shell around this screen, the screen only needs to draw the
+part that actually moves.
+
+Pulling and inspecting the raw `clock_00.png`..`clock_63.png` frames
+(see Asset provenance) showed the window's content is a straight
+blue(day)/black(night) split that rotates over the day, with the sun
+riding the day side and the moon riding the night side, 180 deg apart -
+consistent with a single hidden disc where the sun and moon sit at
+opposite poles. Since the vanilla texture only ever reveals a small
+sliver of that disc through the narrow window, showing the *whole* disc
+requires extrapolating past what any single frame actually shows -
+`drawClockFace()` in `src/main.cpp` reconstructs the full circle: a hard
+day/night terminator line through the center (perpendicular to the
+sun/moon axis) rotating once per Minecraft day, sun and moon discs at
+the two poles. Colors (sky blue, night black, sun yellow, moon gray/blue
+plus its highlight) are sampled directly from real pixels in
+`clock_00.png` and `clock_32.png`, not guessed.
+
+If you'd rather show the literal 64-frame texture pixel-for-pixel
+instead (e.g. no 3D-printed shell, screen shows the whole coin including
+gold casing), the `tools/gen_clock_frames.py` -> `src/clock_frames.h`
+texture-blit approach from an earlier version of this firmware still
+works for that - it's kept in the repo, just not wired into `main.cpp`
+anymore.
 
 ## Asset provenance
 
