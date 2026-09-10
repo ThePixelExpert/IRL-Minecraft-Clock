@@ -13,14 +13,23 @@ static const uint16_t DIAL_RADIUS = 108;
 static const uint16_t BODY_RADIUS = 18;   // sun/moon disc size
 static const uint32_t POLL_INTERVAL_MS = 3000;
 static const uint32_t MC_TICKS_PER_DAY = 24000;
+static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
+
+// Demo mode: runs a fast simulated day/night cycle so the dial, colours and
+// electronics can be tested on the bench with no WiFi, bridge, or Minecraft
+// server at all. Kicks in automatically whenever we've never successfully
+// pulled a real tick count; drops out the moment a real reading arrives.
+static const uint32_t DEMO_CYCLE_SECONDS = 60; // one full simulated MC day per this many real seconds
+static const uint32_t DEMO_TICKS_PER_LOOP = (MC_TICKS_PER_DAY * 50) / (DEMO_CYCLE_SECONDS * 1000);
 
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite frame = TFT_eSprite(&tft);
 
 uint32_t lastPollMs = 0;
-uint32_t currentTicks = 0;      // 0..23999, last known-good value from bridge
-bool haveValidTime = false;
-float displayAngleDeg = 0;      // smoothed rotation actually drawn, eases toward target
+uint32_t currentTicks = 0;      // 0..23999, last known-good value from bridge (or simulated in demo mode)
+bool haveValidTime = false;     // true if the most recent poll succeeded
+bool everHadValidTime = false;  // true once we've received at least one real reading
+bool wifiConnected = false;
 
 // ---- colour helpers -------------------------------------------------------
 
@@ -53,15 +62,24 @@ uint16_t skyColorForTicks(uint32_t ticks) {
 
 // ---- networking -------------------------------------------------------
 
-void connectWiFi() {
+// Non-blocking (bounded) WiFi connect: gives up after WIFI_CONNECT_TIMEOUT_MS
+// so a bench test with no WiFi in range still boots straight into demo mode
+// instead of hanging in setup() forever.
+bool connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.printf("Connecting to WiFi %s", WIFI_SSID);
+  uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - start > WIFI_CONNECT_TIMEOUT_MS) {
+      Serial.println("\nWiFi connect timed out, continuing in demo mode");
+      return false;
+    }
     delay(300);
     Serial.print(".");
   }
   Serial.printf("\nWiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+  return true;
 }
 
 bool fetchTicks(uint32_t &outTicks) {
@@ -111,7 +129,9 @@ void drawMoon(int x, int y, uint16_t color, uint16_t shadowColor) {
   frame.fillCircle(x + BODY_RADIUS / 2, y - BODY_RADIUS / 3, BODY_RADIUS - 2, shadowColor);
 }
 
-void drawClockFace(uint32_t ticks, bool connected) {
+enum class ClockStatus { LIVE, OFFLINE, DEMO };
+
+void drawClockFace(uint32_t ticks, ClockStatus status) {
   uint16_t sky = skyColorForTicks(ticks);
   frame.fillSprite(sky);
 
@@ -157,7 +177,18 @@ void drawClockFace(uint32_t ticks, bool connected) {
   frame.setTextColor(TFT_WHITE, sky);
   frame.drawString(buf, CENTER, CENTER + DIAL_RADIUS - 30, 4);
 
-  frame.fillCircle(CENTER, CENTER + DIAL_RADIUS - 4, 4, connected ? TFT_GREEN : TFT_RED);
+  uint16_t dotColor = TFT_RED;
+  if (status == ClockStatus::LIVE) dotColor = TFT_GREEN;
+  else if (status == ClockStatus::DEMO) dotColor = TFT_ORANGE;
+  frame.fillCircle(CENTER, CENTER + DIAL_RADIUS - 4, 4, dotColor);
+
+  if (status == ClockStatus::DEMO) {
+    frame.setTextColor(TFT_ORANGE, sky);
+    frame.drawString("DEMO", CENTER, CENTER - DIAL_RADIUS + 22, 2);
+  } else if (status == ClockStatus::OFFLINE) {
+    frame.setTextColor(TFT_RED, sky);
+    frame.drawString("OFFLINE", CENTER, CENTER - DIAL_RADIUS + 22, 2);
+  }
 
   frame.pushSprite(0, 0);
 }
@@ -173,29 +204,56 @@ void setup() {
   frame.setColorDepth(16);
   frame.createSprite(SCREEN_SIZE, SCREEN_SIZE);
 
-  connectWiFi();
+  wifiConnected = connectWiFi();
 
-  if (fetchTicks(currentTicks)) haveValidTime = true;
-  drawClockFace(currentTicks, haveValidTime);
+  if (wifiConnected && fetchTicks(currentTicks)) {
+    haveValidTime = true;
+    everHadValidTime = true;
+  }
+
+  ClockStatus status = everHadValidTime ? ClockStatus::LIVE : ClockStatus::DEMO;
+  drawClockFace(currentTicks, status);
   lastPollMs = millis();
 }
 
 void loop() {
   uint32_t now = millis();
 
+  // No WiFi at all (bench test): don't hammer a dead radio, just run demo.
+  if (!wifiConnected && WiFi.status() != WL_CONNECTED) {
+    currentTicks = (currentTicks + DEMO_TICKS_PER_LOOP) % MC_TICKS_PER_DAY;
+    drawClockFace(currentTicks, ClockStatus::DEMO);
+    delay(50);
+    return;
+  }
+  wifiConnected = true;
+
   if (now - lastPollMs >= POLL_INTERVAL_MS) {
     lastPollMs = now;
     uint32_t ticks;
+    ClockStatus status;
+
     if (fetchTicks(ticks)) {
       currentTicks = ticks;
       haveValidTime = true;
+      everHadValidTime = true;
+      status = ClockStatus::LIVE;
     } else {
       haveValidTime = false;
-      // keep advancing the last known time so the dial doesn't freeze
-      // between polls: real MC time runs ~1 tick per real-world 50ms.
-      currentTicks = (currentTicks + (POLL_INTERVAL_MS / 50)) % MC_TICKS_PER_DAY;
+      if (everHadValidTime) {
+        // We know real MC time; keep advancing it between polls so the
+        // dial doesn't freeze. Real MC time runs ~1 tick per 50ms.
+        currentTicks = (currentTicks + (POLL_INTERVAL_MS / 50)) % MC_TICKS_PER_DAY;
+        status = ClockStatus::OFFLINE;
+      } else {
+        // Never reached the bridge/server (e.g. bridge not running yet,
+        // wrong URL, RCON not enabled) - fall back to the fast demo cycle
+        // instead of sitting frozen at tick 0.
+        currentTicks = (currentTicks + DEMO_TICKS_PER_LOOP * (POLL_INTERVAL_MS / 50)) % MC_TICKS_PER_DAY;
+        status = ClockStatus::DEMO;
+      }
     }
-    drawClockFace(currentTicks, haveValidTime);
+    drawClockFace(currentTicks, status);
   }
 
   delay(50);

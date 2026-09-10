@@ -57,6 +57,25 @@ Uses the `TFT_eSPI` library with a GC9A01 driver profile — the custom
 `User_Setup_GC9A01.h` is wired in via `platformio.ini` build flags, no need
 to hand-edit the library's own `User_Setup.h`.
 
+## Demo / fallback mode
+
+The firmware never just sits frozen when it can't reach the bridge:
+
+- **No WiFi at all** (bench testing, no router in range): boots straight
+  into a fast simulated day/night cycle — full 24000-tick MC day every
+  `DEMO_CYCLE_SECONDS` (60s by default) — orange dot + "DEMO" label.
+- **WiFi up but bridge/RCON unreachable, and never has been**: same fast
+  demo cycle, so you can test the display/electronics before the bridge
+  or Minecraft server is even running.
+- **Bridge was reachable before but a poll fails** (network blip, server
+  restart): keeps advancing the *last known real* time at real MC speed
+  (1 tick / 50ms) instead of freezing or jumping to demo — red dot +
+  "OFFLINE" label.
+- **Bridge reachable**: normal green dot, live ticks.
+
+Tune `DEMO_CYCLE_SECONDS` in `src/main.cpp` to speed up/slow down the
+demo cycle.
+
 ## Notes
 
 - Minecraft day cycle is 24000 ticks; 0/24000 = sunrise, 6000 = noon,
@@ -65,3 +84,8 @@ to hand-edit the library's own `User_Setup.h`.
   apart on that dial, sky color interpolates day/dusk/night/dawn bands.
 - If your MC server doesn't have RCON enabled: set `enable-rcon=true`,
   `rcon.password=...`, `rcon.port=25575` in `server.properties` and restart.
+  For this homelab's server (`itzg/minecraft-server` in the `minecraft` LXC,
+  `192.168.68.90`), that means adding `ENABLE_RCON=true`, `RCON_PASSWORD=...`,
+  `RCON_PORT=25575` to its container env and recreating the container —
+  `server.properties` gets regenerated from env vars on that image, editing
+  it directly won't survive a restart.
