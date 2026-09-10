@@ -6,10 +6,12 @@
 #include <math.h>
 
 #include "secrets.h"
-#include "clock_angles.h"
+#include "clock_frames.h"
 
 static const uint16_t SCREEN_SIZE = 240;
 static const uint16_t CENTER = SCREEN_SIZE / 2;
+static const uint16_t SRC_SIZE = 16;                   // edited clock texture is 16x16
+static const uint16_t SCALE = SCREEN_SIZE / SRC_SIZE;   // nearest-neighbor upscale factor (15x)
 static const uint32_t POLL_INTERVAL_MS = 3000;
 static const uint32_t MC_TICKS_PER_DAY = 24000;
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
@@ -83,88 +85,56 @@ bool fetchTicks(uint32_t &outTicks) {
 //
 // This screen sits behind a 3D-printed gold shell that reproduces the
 // coin/case part of the vanilla clock item - so the firmware only needs
-// to draw the part of the item that actually animates: the little sky
-// window with the sun/moon. In the real 16x16 texture that's a small
-// lens-shaped cutout showing a sliver of a hidden rotating day/night
-// wheel (colors sampled directly from clock_00.png/clock_32.png via
-// tools/gen_clock_frames.py - see README's "Isolated animation" section
-// for how that was reverse-engineered from the raw frames). Since the
-// screen is the *entire* visible circle now (no coin around it), that
-// hidden wheel is reconstructed here in full instead of glimpsed through
-// a narrow slot: a straight day/night terminator through the center,
-// rotating once per Minecraft day, with the sun riding the day pole and
-// the moon riding the night pole 180 deg opposite it.
-
-static const uint16_t SKY_DAY     = 0x3A95; // rgb(58,83,172)   - clock_00.png day sky
-static const uint16_t SKY_NIGHT   = 0x18A2; // rgb(24,22,22)    - clock_32.png night sky
-static const uint16_t SUN_COLOR   = 0xFFE0; // rgb(255,255,0)   - clock_00.png sun disc
-static const uint16_t MOON_BASE   = 0x52AD; // rgb(86,86,109)   - clock_32.png moon disc
-static const uint16_t MOON_HILITE = 0x6B71; // rgb(108,108,137) - clock_32.png moon highlight
-
-static const int16_t POLE_DISTANCE = 50; // how far the sun/moon centers sit from screen center
-static const int16_t DISC_RADIUS   = 38; // sun/moon disc size (max reach 88px keeps clear of the HUD text/dot at +-100px)
+// to draw the part of the item that actually animates. clock_frames.h
+// (built by tools/gen_clock_frames.py) is the REAL clock_00.png..
+// clock_63.png pixel data with the gold coin shell edited out and the
+// resulting gaps filled in with the nearest surviving sky/sun/moon pixel
+// - deliberately blocky/pixelated like the source sprite, not smoothed,
+// so there's no rigid edge where the coin shell used to be. This just
+// blits that real edited bitmap, nearest-neighbor scaled 16px -> 240px.
 
 enum class ClockStatus { LIVE, OFFLINE, DEMO };
 
-// Redraw caching: quantize rotation to the same 64 steps the vanilla
-// texture used (24000 ticks / 64 = 375 ticks per step) so we redraw only
-// when the picture would actually visibly change, not on every ~50ms
-// loop tick. That's what actually fixes sluggish/torn refresh - the SPI
-// bus was being asked to push full 240x240 screens far more often than
-// the animation was actually advancing.
-uint8_t lastDrawnStep = 255;
+// Redraw caching: the texture only has 64 visual states (one every 375
+// ticks), so there's no reason to re-blit and re-push a full 240x240
+// frame on every ~50ms loop tick just because currentTicks incremented
+// by a handful. Skipping unchanged frames is what actually fixes
+// sluggish/torn refresh - the SPI bus was being asked to push complete
+// screens far more often than the picture was actually changing.
+uint8_t lastDrawnFrame = 255;
 ClockStatus lastDrawnStatus = static_cast<ClockStatus>(-1);
 
-// Step 0 = solar noon (sun straight up, symmetric day), step 32 =
-// midnight (moon straight up, symmetric night) - same phase convention
-// derived from the real texture frames (tick 0 is sunrise).
-uint8_t animationStepForTicks(uint32_t ticks) {
+// Frame 0 in the vanilla set is solar noon (sun centered, symmetric day
+// sky); frame 32 is midnight (full moon sky); the set advances one frame
+// per 375 ticks (24000 ticks / 64 frames). Shift by 18000 ticks so our
+// tick-0-is-sunrise convention lands on the correct vanilla frame.
+uint8_t frameIndexForTicks(uint32_t ticks) {
   uint32_t shifted = (ticks + 18000UL) % MC_TICKS_PER_DAY;
-  return (uint8_t)((shifted * CLOCK_ANGLE_STEPS) / MC_TICKS_PER_DAY) % CLOCK_ANGLE_STEPS;
+  return (uint8_t)((shifted * CLOCK_FRAME_COUNT) / MC_TICKS_PER_DAY) % CLOCK_FRAME_COUNT;
+}
+
+void blitClockFrame(uint8_t frameIndex) {
+  for (uint16_t y = 0; y < SCREEN_SIZE; y++) {
+    uint16_t srcY = y / SCALE;
+    const uint16_t srcRowBase = srcY * SRC_SIZE;
+    for (uint16_t x = 0; x < SCREEN_SIZE; x++) {
+      uint16_t srcX = x / SCALE;
+      uint16_t color = pgm_read_word(&clockFrames[frameIndex][srcRowBase + srcX]);
+      canvas->drawPixel(x, y, color);
+    }
+  }
 }
 
 void drawClockFace(uint32_t ticks, ClockStatus status) {
-  uint8_t step = animationStepForTicks(ticks);
+  uint8_t frameIndex = frameIndexForTicks(ticks);
 
-  if (step == lastDrawnStep && status == lastDrawnStatus) {
+  if (frameIndex == lastDrawnFrame && status == lastDrawnStatus) {
     return; // nothing a viewer would actually see has changed - skip the SPI push
   }
-  lastDrawnStep = step;
+  lastDrawnFrame = frameIndex;
   lastDrawnStatus = status;
 
-  // Sun pole angle: looked up from the REAL per-frame angle extracted
-  // from clock_00.png..clock_63.png (tools/gen_clock_frames.py), not a
-  // pure linear formula - captures whatever actual (slightly uneven)
-  // motion the vanilla animation has, smoothed just enough to stay fluid
-  // rather than reproducing the raw extraction's pixel-centroid jitter.
-  float sunAngleRad = radians(clockAngleTenthsDeg[step] / 10.0f);
-  float sunDirX = cosf(sunAngleRad);
-  float sunDirY = sinf(sunAngleRad);
-
-  // Per-pixel day/night split: a pixel is on the sun's half of the circle
-  // if its direction from center has a positive dot product with the sun
-  // direction - a hard-edged line through the center, perpendicular to
-  // the sun/moon axis, rotating together with them.
-  for (int16_t y = 0; y < SCREEN_SIZE; y++) {
-    int16_t dy = y - CENTER;
-    for (int16_t x = 0; x < SCREEN_SIZE; x++) {
-      int16_t dx = x - CENTER;
-      float dot = dx * sunDirX + dy * sunDirY;
-      canvas->drawPixel(x, y, dot >= 0 ? SKY_DAY : SKY_NIGHT);
-    }
-  }
-
-  int16_t sunX = CENTER + (int16_t)(sunDirX * POLE_DISTANCE);
-  int16_t sunY = CENTER + (int16_t)(sunDirY * POLE_DISTANCE);
-  int16_t moonX = CENTER - (int16_t)(sunDirX * POLE_DISTANCE);
-  int16_t moonY = CENTER - (int16_t)(sunDirY * POLE_DISTANCE);
-
-  canvas->fillCircle(sunX, sunY, DISC_RADIUS, SUN_COLOR);
-
-  canvas->fillCircle(moonX, moonY, DISC_RADIUS, MOON_BASE);
-  // Small offset highlight so the moon doesn't read as a flat gray dot -
-  // matches the lighter patch visible in the real clock_32.png moon.
-  canvas->fillCircle(moonX - DISC_RADIUS / 3, moonY - DISC_RADIUS / 3, DISC_RADIUS / 2, MOON_HILITE);
+  blitClockFrame(frameIndex);
 
   uint32_t totalMinutes = (uint32_t)((ticks / (float)MC_TICKS_PER_DAY) * 24.0f * 60.0f);
   totalMinutes = (totalMinutes + 6 * 60) % (24 * 60); // MC day starts at 06:00 clock-equivalent
@@ -173,6 +143,9 @@ void drawClockFace(uint32_t ticks, ClockStatus status) {
   char buf[8];
   snprintf(buf, sizeof(buf), "%02lu:%02lu", hh, mm);
 
+  // The extended-fill area near the bottom edge is always a flat sky
+  // color (blue or black; the disc never reaches down this far), so
+  // plain white text reads fine here regardless of time of day.
   canvas->setTextDatum(MC_DATUM);
   canvas->setTextColor(TFT_WHITE);
   canvas->drawString(buf, CENTER, SCREEN_SIZE - 20, 4);

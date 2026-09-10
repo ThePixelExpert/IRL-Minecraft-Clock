@@ -1,13 +1,17 @@
 # mc-clock-esp32
 
 ESP32 + 1.28" round GC9A01 TFT (240x240) displaying live Minecraft server
-time as an isolated recreation of the vanilla clock item's animated part
-only. This is designed to sit inside a 3D-printed shell that reproduces
-the item's gold coin casing - the screen only needs to show what actually
-moves: a day/night sky with the sun or moon, extrapolated from the real
-game texture's tiny sky window to fill the whole round screen. See
-"Isolated animation" below for how the geometry was derived, and "Asset
-provenance" before sharing this repo publicly.
+time as the real vanilla clock item animation, edited down to just its
+moving part. This is designed to sit inside a 3D-printed shell that
+reproduces the item's gold coin casing - the screen only needs to show
+what actually animates. `tools/gen_clock_frames.py` takes the real
+`clock_00.png`..`clock_63.png` game textures, edits out the gold coin
+pixels, and fills the resulting gaps with the nearest surviving sky/sun/
+moon pixel so there's no rigid edge where the coin shell used to be -
+still the real, blocky/pixelated per-frame texture data, just extended
+to fill the whole screen instead of a small window. See "Isolated
+animation" below for the details, and "Asset provenance" before sharing
+this repo publicly.
 
 ## Architecture
 
@@ -118,51 +122,46 @@ nothing about the display. If the screen stays blank after flashing:
 ## Isolated animation (for the 3D-printed shell build)
 
 The real clock item is a gold coin with a small lens-shaped window near
-the top showing a sliver of a hidden rotating day/night wheel - most of
-the item is static gold casing. If you're 3D-printing that gold casing as
-a physical shell around this screen, the screen only needs to draw the
-part that actually moves.
+the top showing a sliver of the sky/sun/moon animation - most of the
+item is static gold casing. If you're 3D-printing that gold casing as a
+physical shell around this screen, the screen only needs to show what's
+behind the window, extended out to fill the whole round screen instead
+of a small cutout.
 
-Pulling and inspecting the raw `clock_00.png`..`clock_63.png` frames
-(see Asset provenance) showed the window's content is a straight
-blue(day)/black(night) split that rotates over the day, with the sun
-riding the day side and the moon riding the night side, 180 deg apart -
-consistent with a single hidden disc where the sun and moon sit at
-opposite poles. Since the vanilla texture only ever reveals a small
-sliver of that disc through the narrow window, showing the *whole* disc
-requires extrapolating past what any single frame actually shows -
-`drawClockFace()` in `src/main.cpp` reconstructs the full circle: a hard
-day/night terminator line through the center (perpendicular to the
-sun/moon axis) rotating once per Minecraft day, sun and moon discs at
-the two poles. Colors (sky blue, night black, sun yellow, moon gray/blue
-plus its highlight) are sampled directly from real pixels in
-`clock_00.png` and `clock_32.png`, not guessed.
+`tools/gen_clock_frames.py` builds this by literally editing the real
+`clock_00.png`..`clock_63.png` textures, per frame:
 
-**The rotation angle itself is extracted from the real frames too, not a
-linear formula.** `tools/gen_clock_frames.py` classifies every pixel in
-each of the 64 frames (sun/moon/day-blue/night-black vs. the gold shell,
-including the shell's own subtle per-frame shimmer, which had to be
-told apart from real sky colors by hue shape rather than "does it change
-between frames" - it does, and that's not the same thing as being part of
-the animation) and takes the sun's (or moon's) pixel centroid angle
-relative to the window's center. That gives 64 real angles - but a 16x16
-sprite only has a handful of sun/moon pixels to centroid (as few as 1-2
-near sunrise/sunset), so the raw extraction is noisy and briefly dips
-backwards frame to frame. The script clips that to monotonic and blends
-it 50/50 with a perfectly even 360/64-degree progression before baking
-it into `src/clock_angles.h` - real extracted motion data, smoothed just
-enough to read as fluid instead of jittery on a screen 15x bigger than
-the source sprite.
+1. **Classify every pixel** as sky-blue, night-black, sun, moon, or gold
+   coin shell. This can't just be "does this pixel change between
+   frames" (an earlier attempt did that) - the gold shell has its own
+   subtle per-frame shimmer/highlight shading that has nothing to do
+   with the sky animation, so that test let gold pixels leak in as fake
+   "window" content. Classifying by color shape instead (gold has a
+   distinct r > g > b warm signature the sky/sun/moon colors never do)
+   fixed it.
+2. **Delete the gold shell pixels** (and transparent corners), keeping
+   only the real sky/sun/moon pixels exactly as they are.
+3. **Fill every deleted pixel** with the color of the *nearest surviving*
+   sky/sun/moon pixel (a plain nearest-neighbor flood fill - deliberately
+   blocky/pixelated, matching the source sprite's own look, not smoothed
+   into a gradient) so there's no rigid edge where the coin shell used to
+   be.
 
-An earlier version of this firmware instead tried isolating the raw
-per-frame *pixels* (masking out the gold shell, flood-filling the gaps
-with the nearest surviving sky color) and blitting that bitmap directly.
-It looked wrong: a fixed dark "shadow" pixel band under the sun/moon
-disc - present in the source texture in every frame, not really part of
-day/night at all - flood-filled into a big blocky rectangle when
-extended out to fill the whole screen. Extracting just the angle and
-re-rendering procedurally avoids that while still being driven by real
-per-frame game data for the motion.
+One more real wrinkle: two rows right under where the sun/moon sits (row
+7-8 of the 16x16 sprite) have pixels that are black even in the fully-lit
+noon frame and blue even in the fully-dark midnight frame - a fixed
+shading/shadow detail on the coin surface, not real day or night. Using
+those as fill sources would flood-fill a big wrong-colored block across
+half the screen once extended (this happened in an earlier version of
+the script - noon came out half black). The fix: those specific pixels
+are excluded from *seeding* the fill (step 3 above) - they're real
+texture pixels and still present in the output, they just don't get to
+dictate what a large chunk of empty space around them becomes.
+
+The result (`src/clock_frames.h`, a 64-frame RGB565 table) is blitted
+nearest-neighbor scaled 16px -> 240px by `blitClockFrame()` in
+`src/main.cpp` - the real edited/extended texture data, pixelated like
+the source sprite, not a from-scratch procedural recreation.
 
 ## Asset provenance
 

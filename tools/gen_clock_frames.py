@@ -1,28 +1,44 @@
 #!/usr/bin/env python3
 """
-Extracts the REAL sun/moon rotation angle from each of the 64 vanilla
-Minecraft clock item textures (clock_00.png..clock_63.png) and bakes it
-into src/clock_angles.h as a 64-entry lookup table.
+Downloads the 64 vanilla Minecraft clock item textures (clock_00.png ..
+clock_63.png, 16x16 each), edits out the static gold coin shell so only
+the sky/sun/moon window remains, then fills every removed pixel with the
+color of the nearest surviving sky/sun/moon pixel (nearest-neighbor -
+same blocky/pixelated style as the source art, not smoothed) so there's
+no rigid edge where the coin shell used to be. Bakes the resulting 64
+frames into src/clock_frames.h as an RGB565 PROGMEM table the ESP32
+firmware blits directly (nearest-neighbor scaled 16px -> 240px).
 
-The item's actual pixel data only ever shows a tiny sky/sun/moon window
-through the gold coin case - most of each 16x16 frame is coin, not sky.
-Classifying each frame's pixels (sun/moon/day-blue/night-black vs.
-gold-shell) and taking the centroid of the sun (or moon, offset 180 deg)
-pixels relative to the window's own center gives the REAL angle the game
-used for that frame - not a linear approximation. Naive nearest-neighbor
-flood-fill inpainting of the raw pixels (an earlier version of this
-script) produced blocky rectangular artifacts where a frame's dark
-"eyebrow" shading pixels got smeared across half the image; extracting
-just the angle and re-rendering procedurally (src/main.cpp's
-drawClockFace) avoids that while still being driven by real per-frame
-game data for the motion.
+Two things the naive version of this got wrong, both fixed here:
+
+1. Classifying "is this pixel part of the window" by whether it differs
+   across the 64 frames is wrong - the gold shell has its own subtle
+   per-frame shimmer/highlight shading unrelated to the sky animation,
+   so that test let some gold pixels leak in as fake "window" seeds.
+   Fixed by classifying per-pixel-per-frame by color family instead
+   (gold has a distinct r > g > b warm signature the sky/sun/moon
+   colors never do).
+
+2. Rows 7-8 (right under where the sun/moon sits) have a handful of
+   pixels that are black even in the full-daytime frame and blue even
+   in the full-nighttime frame - a fixed shadow/shading detail on the
+   coin surface, not real day/night. Using those as fill seeds paints
+   a big wrong-colored block for half the image once flood-filled
+   outward. Fixed by excluding blue/black (but not sun/moon) pixels in
+   those two rows from seeding the fill - they still get filled in
+   themselves, just from the real sky pixels above them instead of
+   contributing their own misleading color.
+
+These are still Mojang's own game assets (isolated/extended, not
+redrawn) - see README.md's Asset provenance section before sharing this
+repo publicly.
 
 Usage:
     pip install pillow requests
     python3 tools/gen_clock_frames.py
 """
-import math
 import sys
+from collections import deque
 from pathlib import Path
 
 try:
@@ -38,7 +54,15 @@ BASE_URL = (
 )
 FRAME_COUNT = 64
 SIZE = 16
-OUT_PATH = Path(__file__).parent.parent / "src" / "clock_angles.h"
+# Empirically identified (see module docstring, point 2): rows where a
+# fixed shadow detail can masquerade as day/night sky and must not be
+# allowed to seed the fill, even though it's still a real texture pixel.
+SHADOW_ROWS = {7, 8}
+OUT_PATH = Path(__file__).parent.parent / "src" / "clock_frames.h"
+
+
+def rgb565(r: int, g: int, b: int) -> int:
+    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
 
 
 def fetch_frame(i: int) -> Image.Image:
@@ -71,97 +95,65 @@ def classify(r: int, g: int, b: int, a: int):
     return None
 
 
-def extract_raw_angle_deg(img: Image.Image):
-    """Degrees (atan2 convention, -180..180) from the window's own center
-    to the sun's centroid - or the moon's centroid + 180, when no sun is
-    visible in this frame. Returns None if neither is visible (shouldn't
-    happen across a full 64-frame cycle, but fall back to None just in
-    case some other reference asset build behaves differently)."""
-    sun_pts, moon_pts, other_pts = [], [], []
+def inpaint_frame(frame: Image.Image):
+    """Multi-source BFS flood fill from the real, edited-in window pixels
+    outward - deliberately blocky/pixelated (nearest surviving pixel,
+    same look as the source sprite), not smoothed. Shadow-row blue/black
+    pixels are real texture data and kept in the output, just not used to
+    seed the fill outward (see module docstring)."""
+    grid = [[None] * SIZE for _ in range(SIZE)]
+    q = deque()
     for y in range(SIZE):
         for x in range(SIZE):
-            c = classify(*img.getpixel((x, y)))
-            if c == "sun":
-                sun_pts.append((x, y))
-            elif c == "moon":
-                moon_pts.append((x, y))
-            elif c in ("blue", "black"):
-                other_pts.append((x, y))
+            r, g, b, a = frame.getpixel((x, y))
+            c = classify(r, g, b, a)
+            if c is None:
+                continue
+            if c in ("blue", "black") and y in SHADOW_ROWS:
+                continue  # misleading shadow pixel - leave blank, let the fill overwrite it
+            grid[y][x] = (r, g, b)
+            q.append((x, y))
 
-    all_pts = sun_pts + moon_pts + other_pts
-    if not all_pts:
-        return None
-    cx = sum(p[0] for p in all_pts) / len(all_pts)
-    cy = sum(p[1] for p in all_pts) / len(all_pts)
+    while q:
+        x, y = q.popleft()
+        color = grid[y][x]
+        for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            if 0 <= nx < SIZE and 0 <= ny < SIZE and grid[ny][nx] is None:
+                grid[ny][nx] = color
+                q.append((nx, ny))
 
-    if sun_pts:
-        sx = sum(p[0] for p in sun_pts) / len(sun_pts)
-        sy = sum(p[1] for p in sun_pts) / len(sun_pts)
-        return math.degrees(math.atan2(sy - cy, sx - cx))
-    if moon_pts:
-        mx = sum(p[0] for p in moon_pts) / len(moon_pts)
-        my = sum(p[1] for p in moon_pts) / len(moon_pts)
-        return math.degrees(math.atan2(my - cy, mx - cx)) + 180
-    return None
-
-
-def unwrap(raw_angles):
-    """Turns the -180..180 per-frame angles into a smooth monotonically
-    increasing sequence (handles the wraparound crossing) so the runtime
-    lookup table can be used directly without extra wrap logic."""
-    unwrapped = [raw_angles[0]]
-    for raw in raw_angles[1:]:
-        prev = unwrapped[-1]
-        delta = ((raw - prev + 180) % 360) - 180
-        unwrapped.append(prev + delta)
-    return unwrapped
+    return grid
 
 
 def main() -> None:
     print("fetching 64 frames...")
     frames = [fetch_frame(i) for i in range(FRAME_COUNT)]
 
-    print("extracting real per-frame sun/moon angle...")
-    raw_angles = []
+    print("editing out the coin shell + filling gaps for each frame...")
+    all_pixels = []
     for i, frame in enumerate(frames):
-        angle = extract_raw_angle_deg(frame)
-        if angle is None:
-            sys.exit(f"frame {i}: couldn't find sun or moon pixels")
-        raw_angles.append(angle)
-        print(f"  frame {i:02d}: {angle:7.1f} deg")
-
-    angles = unwrap(raw_angles)
-    # Shift so frame 0 (extracted as roughly -90, i.e. "up") lands exactly
-    # on -90 - matches drawClockFace()'s screen-space convention where
-    # -90 deg is straight up.
-    shift = -90.0 - angles[0]
-    angles = [a + shift for a in angles]
-
-    # A 16x16 sprite only has a handful of sun/moon pixels to centroid
-    # (as few as 1-2 near sunrise/sunset), so the raw extracted angles are
-    # noisy - occasionally even dipping backwards frame to frame, which
-    # would look like a jerky/jittery "moonwalk" on a big smooth screen
-    # instead of the fluid motion asked for. Two passes fix that while
-    # keeping real extracted data as half the signal (not discarding it):
-    for i in range(1, FRAME_COUNT):  # 1. clip backward dips (force monotonic)
-        angles[i] = max(angles[i], angles[i - 1])
-    ideal = [angles[0] + i * (360.0 / FRAME_COUNT) for i in range(FRAME_COUNT)]
-    angles = [0.5 * a + 0.5 * b for a, b in zip(angles, ideal)]  # 2. blend toward even spacing
+        grid = inpaint_frame(frame)
+        pixels = [rgb565(*grid[y][x]) for y in range(SIZE) for x in range(SIZE)]
+        all_pixels.append(pixels)
 
     with OUT_PATH.open("w") as f:
         f.write("#pragma once\n")
         f.write("#include <Arduino.h>\n\n")
         f.write(
-            "// Real per-frame sun/moon rotation angle, extracted from the\n"
-            "// actual clock_00..clock_63.png pixel data (tools/gen_clock_frames.py)\n"
-            "// rather than assumed to be perfectly linear. Degrees, fixed-point\n"
-            "// x10 (e.g. -900 = -90.0 deg), screen-space convention (-90 = up).\n"
-            "// See README.md's Asset provenance section before sharing this\n"
-            "// repo publicly.\n"
+            "// Real vanilla clock animation with the gold coin shell edited\n"
+            "// out and the resulting gaps filled with the nearest surviving\n"
+            "// sky/sun/moon pixel (tools/gen_clock_frames.py) - deliberately\n"
+            "// blocky/pixelated like the source sprite, not smoothed. Meant\n"
+            "// for a screen mounted behind a 3D-printed reproduction of the\n"
+            "// coin shell. See README.md's Asset provenance section before\n"
+            "// sharing this repo publicly.\n"
         )
-        f.write(f"static const uint16_t CLOCK_ANGLE_STEPS = {FRAME_COUNT};\n")
-        vals = ", ".join(f"{round(a * 10):d}" for a in angles)
-        f.write(f"static const int16_t clockAngleTenthsDeg[{FRAME_COUNT}] = {{ {vals} }};\n")
+        f.write(f"static const uint16_t CLOCK_FRAME_COUNT = {FRAME_COUNT};\n")
+        f.write(f"static const uint16_t clockFrames[{FRAME_COUNT}][{SIZE*SIZE}] PROGMEM = {{\n")
+        for pixels in all_pixels:
+            hex_vals = ", ".join(f"0x{p:04X}" for p in pixels)
+            f.write(f"  {{ {hex_vals} }},\n")
+        f.write("};\n")
 
     print(f"wrote {OUT_PATH}")
 
