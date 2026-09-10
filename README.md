@@ -125,43 +125,27 @@ The real clock item is a gold coin with a small lens-shaped window near
 the top showing a sliver of the sky/sun/moon animation - most of the
 item is static gold casing. If you're 3D-printing that gold casing as a
 physical shell around this screen, the screen only needs to show what's
-behind the window, extended out to fill the whole round screen instead
-of a small cutout.
+behind the window.
 
-`tools/gen_clock_frames.py` builds this by literally editing the real
-`clock_00.png`..`clock_63.png` textures, per frame:
+**Current state (first pass):** `tools/gen_clock_frames.py` edits the
+real `clock_00.png`..`clock_63.png` textures by classifying every pixel
+as sky-blue, night-black, sun, moon, or gold coin shell, then deleting
+the gold shell pixels (and transparent corners) - everywhere the coin
+used to be is just black, keeping only the real sky/sun/moon pixels
+exactly as they are, no fill/extension yet. That's `src/clock_frames.h`,
+blitted nearest-neighbor scaled 16px -> 240px by `blitClockFrame()` in
+`src/main.cpp`.
 
-1. **Classify every pixel** as sky-blue, night-black, sun, moon, or gold
-   coin shell. This can't just be "does this pixel change between
-   frames" (an earlier attempt did that) - the gold shell has its own
-   subtle per-frame shimmer/highlight shading that has nothing to do
-   with the sky animation, so that test let gold pixels leak in as fake
-   "window" content. Classifying by color shape instead (gold has a
-   distinct r > g > b warm signature the sky/sun/moon colors never do)
-   fixed it.
-2. **Delete the gold shell pixels** (and transparent corners), keeping
-   only the real sky/sun/moon pixels exactly as they are.
-3. **Fill every deleted pixel** with the color of the *nearest surviving*
-   sky/sun/moon pixel (a plain nearest-neighbor flood fill - deliberately
-   blocky/pixelated, matching the source sprite's own look, not smoothed
-   into a gradient) so there's no rigid edge where the coin shell used to
-   be.
+Classifying "is this pixel part of the window" by whether it changes
+across the 64 frames doesn't work - the gold shell has its own subtle
+per-frame shimmer/highlight shading unrelated to the sky animation, so
+that test lets gold pixels leak in as fake "window" content. Classifying
+by color shape instead (gold has a distinct r > g > b warm signature the
+sky/sun/moon colors never do) avoids that.
 
-One more real wrinkle: two rows right under where the sun/moon sits (row
-7-8 of the 16x16 sprite) have pixels that are black even in the fully-lit
-noon frame and blue even in the fully-dark midnight frame - a fixed
-shading/shadow detail on the coin surface, not real day or night. Using
-those as fill sources would flood-fill a big wrong-colored block across
-half the screen once extended (this happened in an earlier version of
-the script - noon came out half black). The fix: those specific pixels
-are excluded from *seeding* the fill (step 3 above) - they're real
-texture pixels and still present in the output, they just don't get to
-dictate what a large chunk of empty space around them becomes.
-
-The result (`src/clock_frames.h`, a 64-frame RGB565 table) is blitted
-nearest-neighbor scaled 16px -> 240px by `blitClockFrame()` in
-`src/main.cpp` - the real edited/extended texture data, pixelated like
-the source sprite, not a from-scratch procedural recreation.
+Filling in the black area to extend the sky/sun/moon out to the edges of
+the screen (instead of leaving it black) is the next pass, once this is
+confirmed looking right on real hardware.
 
 ## Asset provenance
 
