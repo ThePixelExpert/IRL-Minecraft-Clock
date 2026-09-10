@@ -78,6 +78,40 @@ The firmware never just sits frozen when it can't reach the bridge:
 Tune `DEMO_CYCLE_SECONDS` in `src/main.cpp` to speed up/slow down the
 demo cycle.
 
+## Troubleshooting: screen shows nothing
+
+The ESP32's own LED just means the board has power/is running — it says
+nothing about the display. If the screen stays blank after flashing:
+
+1. **Flash the isolated display test first**, before debugging the full
+   clock firmware:
+   ```
+   pio run -e display_test -t upload -t monitor
+   ```
+   This has zero WiFi/HTTP/JSON code — just `tft.init()` and color fills.
+   If this also shows nothing, it's wiring/power/driver, not application
+   logic.
+2. **Check the backlight (BLK) is actually powered.** On many round GC9A01
+   boards the backlight is a separate LED that needs its own supply — if
+   it's not wired (or wired to a GPIO you never drove HIGH), the panel can
+   be drawing correctly and you'd still see nothing.
+3. **Double check every pin against `src/User_Setup_GC9A01.h`** — SCLK 18,
+   MOSI 23, CS 5, DC 2, RST 4. DC and CS are the two most commonly swapped.
+4. **Try `TFT_INVERSION_ON`** in `src/User_Setup_GC9A01.h` — already on by
+   default in this repo since most GC9A01 clones need it; if you're
+   getting a fully white/blank screen specifically, try commenting it out
+   instead (some panels are the opposite).
+5. **Lower `SPI_FREQUENCY`** (already defaulted to 20MHz here) — loose
+   breadboard/dupont wiring often can't handle 40MHz+ and shows garbage or
+   nothing.
+6. **Check power**: logic is 3.3V — do not feed VCC 5V unless your specific
+   board explicitly has a 5V-tolerant regulator on it (check the
+   silkscreen/seller listing).
+7. Watch the serial monitor (115200 baud) — both firmwares print what
+   they're doing. If you see `display_test: RED` / `GREEN` / `BLUE`
+   scrolling but the screen never changes, that confirms it's hardware
+   (wiring/backlight/power), not code.
+
 ## Notes
 
 - Minecraft day cycle is 24000 ticks; 0/24000 = sunrise, 6000 = noon,
