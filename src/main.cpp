@@ -10,8 +10,20 @@
 
 static const uint16_t SCREEN_SIZE = 240;
 static const uint16_t CENTER = SCREEN_SIZE / 2;
-static const uint16_t SRC_SIZE = 16;                   // edited clock texture is 16x16
-static const uint16_t SCALE = SCREEN_SIZE / SRC_SIZE;   // nearest-neighbor upscale factor (15x)
+static const uint16_t SRC_SIZE = 16;   // edited clock texture is 16x16
+
+// The real sky/sun/moon content only ever occupies this bounding box
+// within the 16x16 texture (rows 2-8, cols 3-12 - verified by checking
+// every frame; everything outside it is coin shell, now black). Crop to
+// just that box and stretch it to fill the whole screen instead of
+// upscaling the full 16x16 canvas uniformly, which would leave the real
+// content as a small patch surrounded by a black margin.
+static const uint16_t CROP_ROW_START = 2;
+static const uint16_t CROP_ROW_END   = 9;  // exclusive
+static const uint16_t CROP_COL_START = 3;
+static const uint16_t CROP_COL_END   = 13; // exclusive
+static const uint16_t CROP_H = CROP_ROW_END - CROP_ROW_START;
+static const uint16_t CROP_W = CROP_COL_END - CROP_COL_START;
 static const uint32_t POLL_INTERVAL_MS = 3000;
 static const uint32_t MC_TICKS_PER_DAY = 24000;
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
@@ -115,10 +127,10 @@ uint8_t frameIndexForTicks(uint32_t ticks) {
 
 void blitClockFrame(uint8_t frameIndex) {
   for (uint16_t y = 0; y < SCREEN_SIZE; y++) {
-    uint16_t srcY = y / SCALE;
+    uint16_t srcY = CROP_ROW_START + (uint16_t)(((uint32_t)y * CROP_H) / SCREEN_SIZE);
     const uint16_t srcRowBase = srcY * SRC_SIZE;
     for (uint16_t x = 0; x < SCREEN_SIZE; x++) {
-      uint16_t srcX = x / SCALE;
+      uint16_t srcX = CROP_COL_START + (uint16_t)(((uint32_t)x * CROP_W) / SCREEN_SIZE);
       uint16_t color = pgm_read_word(&clockFrames[frameIndex][srcRowBase + srcX]);
       canvas->drawPixel(x, y, color);
     }
