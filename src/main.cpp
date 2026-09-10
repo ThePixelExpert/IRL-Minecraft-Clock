@@ -126,11 +126,22 @@ uint8_t frameIndexForTicks(uint32_t ticks) {
 }
 
 void blitClockFrame(uint8_t frameIndex) {
+  // One uniform scale factor for both axes (preserves the source's
+  // aspect ratio - no stretching), picked large enough that the scaled
+  // content fully covers the square screen. Since CROP_W (10) > CROP_H
+  // (7), that means the width doesn't fully fit; centered horizontally,
+  // some of the leftmost/rightmost sky is simply off-screen, which is
+  // fine - better than distorting the shape.
+  float scale = max((float)SCREEN_SIZE / CROP_W, (float)SCREEN_SIZE / CROP_H);
+  float usedSrcSize = SCREEN_SIZE / scale;         // source units actually visible on screen (same for both axes)
+  float srcOriginX = CROP_COL_START + (CROP_W - usedSrcSize) / 2.0f;
+  float srcOriginY = CROP_ROW_START + (CROP_H - usedSrcSize) / 2.0f;
+
   for (uint16_t y = 0; y < SCREEN_SIZE; y++) {
-    uint16_t srcY = CROP_ROW_START + (uint16_t)(((uint32_t)y * CROP_H) / SCREEN_SIZE);
+    uint16_t srcY = (uint16_t)(srcOriginY + (y / (float)SCREEN_SIZE) * usedSrcSize);
     const uint16_t srcRowBase = srcY * SRC_SIZE;
     for (uint16_t x = 0; x < SCREEN_SIZE; x++) {
-      uint16_t srcX = CROP_COL_START + (uint16_t)(((uint32_t)x * CROP_W) / SCREEN_SIZE);
+      uint16_t srcX = (uint16_t)(srcOriginX + (x / (float)SCREEN_SIZE) * usedSrcSize);
       uint16_t color = pgm_read_word(&clockFrames[frameIndex][srcRowBase + srcX]);
       canvas->drawPixel(x, y, color);
     }
