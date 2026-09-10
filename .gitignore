@@ -1,0 +1,5 @@
+.pio/
+.vscode/
+src/secrets.h
+bridge/config.json
+__pycache__/
