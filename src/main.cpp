@@ -105,38 +105,39 @@ bool fetchTicks(uint32_t &outTicks) {
 // the "coin shell", the whole screen is the "window". dial.h (built by
 // tools/gen_dial_asset.py from the REAL pre-1.5 misc/dial.png) is that
 // same rotating dial texture the original clock item sampled, before
-// Minecraft 1.5 replaced it with a pre-rendered 64-frame animation. We
-// use the original approach instead of the modern one specifically
-// because it rotates continuously rather than stepping through 64 fixed
-// positions - see
-// https://minecraft.wiki/w/Procedural_animated_texture_generation/Clocks
+// Minecraft 1.5 replaced it with a pre-rendered 64-frame animation -
+// see https://minecraft.wiki/w/Procedural_animated_texture_generation/Clocks
 //
-// Algorithm (ported from that page's setup_clock_sprite pseudocode):
-// for each output pixel, take its position centered on the screen as a
-// (u, v) pair in [-0.5, 0.5], rotate that coordinate by -dial_angle, and
-// sample dial.h at the rotated position (wrapping around its edges).
-// The item-mask/fuchsia-multiply step in the original isn't needed here
-// since every screen pixel is "window" - there's no static coin shell
-// to draw around it, that's the real 3D-printed part.
+// renderDial() below ports that page's setup_clock_sprite pseudocode
+// closely: same rx/ry rotation, same u/v centering, same rotated-lookup
+// indexing into the dial texture, same dial_pix.rgb *= pix.r shading
+// multiply at the end. The one real substitution is what stands in for
+// "pix.r" (the source item texture's fuchsia-channel intensity, which
+// marked - and shaded - the window in the real item texture): there's
+// no real Mojang item texture in play here, since the physical 3D-printed
+// shell is the actual coin casing, not a drawn one. itemMask() below is
+// our own procedural falloff standing in for it - not derived from any
+// Mojang asset - full brightness near the pivot, fading at the visible
+// patch's edges, giving the same graduated-shading look the original's
+// varying-intensity fuchsia values produced.
+//
+// The page also notes the real (pre-1.5) system had "230 visually
+// distinct frames" - not infinitely smooth - and that the modern clock
+// sprite's window shape would give 218 if procedurally regenerated.
+// TOTAL_FRAMES below quantizes dial_angle to that same 218, rather than
+// a continuous float, so the rotation visibly steps between distinct
+// positions like the original did instead of gliding.
 
 enum class ClockStatus { LIVE, OFFLINE, DEMO };
 
-// Redraw throttling: dial_angle is now continuous, so "did anything
-// change" can't be an equality check like the old discrete frame index
-// was. At real MC speed (20 real minutes/day = ~0.3 deg/sec) a redraw
-// every loop tick would be imperceptibly finer than this threshold and
-// just re-triggers the exact SPI bottleneck the old frame-skip logic
-// was written to avoid. Redraw once the dial has actually turned far
-// enough to look different.
-static const float MIN_REDRAW_ANGLE_STEP = 0.5f * DEG_TO_RAD;
-float lastDrawnAngle = -1000.0f; // sentinel guarantees the first call always draws
-ClockStatus lastDrawnStatus = static_cast<ClockStatus>(-1);
+static const int TOTAL_FRAMES = 218;
 
-float angularDelta(float a, float b) {
-  float d = fmodf(a - b + PI, 2.0f * PI);
-  if (d < 0) d += 2.0f * PI;
-  return fabsf(d - PI);
+int frameIndexFromTicks(uint32_t ticks) {
+  return (int)(((uint64_t)ticks * TOTAL_FRAMES) / MC_TICKS_PER_DAY) % TOTAL_FRAMES;
 }
+
+int lastDrawnFrame = -1; // sentinel guarantees the first call always draws
+ClockStatus lastDrawnStatus = static_cast<ClockStatus>(-1);
 
 // The real clock item's window only ever reveals a small sliver of a much
 // larger rotating dial, and day/night content sits on opposite sides of
@@ -155,6 +156,27 @@ float angularDelta(float a, float b) {
 // in the original either).
 static const float DIAL_ZOOM = 2.5f;
 
+// Reaches exactly the screen's farthest corner (top-left/top-right,
+// since the pivot sits at the bottom): sqrt(0.5^2 + 1^2) / DIAL_ZOOM.
+static const float MASK_RADIUS = 1.1180339887f / DIAL_ZOOM;
+
+// Stands in for pix.r in the original - see the comment block above.
+float itemMask(float u, float v) {
+  float r = sqrtf(u * u + v * v) / MASK_RADIUS;
+  float mask = 1.0f - r;
+  if (mask < 0.0f) return 0.0f;
+  if (mask > 1.0f) return 1.0f;
+  return mask;
+}
+
+// dial_pix.rgb *= pix.r, for a packed RGB565 pixel.
+uint16_t scaleColor565(uint16_t color, float factor) {
+  uint8_t r = (uint8_t)(((color >> 11) & 0x1F) * factor);
+  uint8_t g = (uint8_t)(((color >> 5) & 0x3F) * factor);
+  uint8_t b = (uint8_t)((color & 0x1F) * factor);
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
 void renderDial(float dialAngle) {
   float rx = sinf(-dialAngle);
   float ry = cosf(-dialAngle);
@@ -166,25 +188,27 @@ void renderDial(float dialAngle) {
     uint16_t ly = localY(y);
     for (uint16_t x = 0; x < SCREEN_SIZE; x++) {
       float u = -(x / (float)(SCREEN_SIZE - 1) - 0.5f) / DIAL_ZOOM;
+      float mask = itemMask(u, v);
       int32_t dx = (int32_t)((u * ry + v * rx + 0.5f) * DIAL_WIDTH)  % DIAL_WIDTH;
       int32_t dy = (int32_t)((v * ry - u * rx + 0.5f) * DIAL_HEIGHT) % DIAL_HEIGHT;
       if (dx < 0) dx += DIAL_WIDTH;
       if (dy < 0) dy += DIAL_HEIGHT;
-      uint16_t color = pgm_read_word(&dial[dy * DIAL_WIDTH + dx]);
-      surface->drawPixel(x, ly, color);
+      uint16_t dialPix = pgm_read_word(&dial[dy * DIAL_WIDTH + dx]);
+      surface->drawPixel(x, ly, scaleColor565(dialPix, mask));
     }
   }
 }
 
 void drawClockFace(uint32_t ticks, ClockStatus status) {
-  float dialAngle = (ticks / (float)MC_TICKS_PER_DAY) * 2.0f * PI;
+  int frameIndex = frameIndexFromTicks(ticks);
 
-  if (angularDelta(dialAngle, lastDrawnAngle) < MIN_REDRAW_ANGLE_STEP && status == lastDrawnStatus) {
+  if (frameIndex == lastDrawnFrame && status == lastDrawnStatus) {
     return; // nothing a viewer would actually see has changed - skip the SPI push
   }
-  lastDrawnAngle = dialAngle;
+  lastDrawnFrame = frameIndex;
   lastDrawnStatus = status;
 
+  float dialAngle = frameIndex * (2.0f * PI / TOTAL_FRAMES);
   renderDial(dialAngle);
 
   uint32_t totalMinutes = (uint32_t)((ticks / (float)MC_TICKS_PER_DAY) * 24.0f * 60.0f);
