@@ -160,13 +160,20 @@ static const float DIAL_ZOOM = 2.5f;
 // since the pivot sits at the bottom): sqrt(0.5^2 + 1^2) / DIAL_ZOOM.
 static const float MASK_RADIUS = 1.1180339887f / DIAL_ZOOM;
 
+// Number of discrete shade bands the falloff snaps to (plus fully-dark
+// below the lowest band) - a smooth analog gradient here fights the
+// blocky pixel-art look everywhere else; pixel art shades in a handful
+// of visible steps, not a continuous fade.
+static const int MASK_LEVELS = 4;
+
 // Stands in for pix.r in the original - see the comment block above.
 float itemMask(float u, float v) {
   float r = sqrtf(u * u + v * v) / MASK_RADIUS;
   float mask = 1.0f - r;
-  if (mask < 0.0f) return 0.0f;
-  if (mask > 1.0f) return 1.0f;
-  return mask;
+  if (mask <= 0.0f) return 0.0f;
+  if (mask >= 1.0f) return 1.0f;
+  int level = (int)(mask * MASK_LEVELS); // 0..MASK_LEVELS-1
+  return (level + 1) / (float)MASK_LEVELS;
 }
 
 // dial_pix.rgb *= pix.r, for a packed RGB565 pixel.
