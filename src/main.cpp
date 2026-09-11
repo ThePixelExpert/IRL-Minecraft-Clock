@@ -153,7 +153,7 @@ float angularDelta(float a, float b) {
 // texel cover *more* screen pixels - blockier, not smoother, matching
 // the wiki algorithm's own direct pixel lookup (no bilinear filtering
 // in the original either).
-static const float DIAL_ZOOM = 4.0f;
+static const float DIAL_ZOOM = 2.5f;
 
 void renderDial(float dialAngle) {
   float rx = sinf(-dialAngle);
