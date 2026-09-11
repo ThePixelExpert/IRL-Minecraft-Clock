@@ -156,32 +156,32 @@ ClockStatus lastDrawnStatus = static_cast<ClockStatus>(-1);
 // in the original either).
 static const float DIAL_ZOOM = 2.5f;
 
-// The real item's fuchsia window is a small, FIXED shape (in item-space)
-// that a much bigger dial rotates underneath - the sun/moon icon on the
-// dial doesn't redraw itself frame to frame, it only *looks* like it's
-// changing shape because the window's fixed edge continuously clips a
-// different silhouette of it into view as it rotates through. Our
-// physical shell isn't shaped to do that clipping (it's sized to the
-// clock's outer casing, not this dial texture's tiny features), so it
-// has to happen here in software: WINDOW_RADIUS defines a hard-edged
-// circular porthole, comparable in size to the dial's own icon
-// features, positioned above the bottom pivot. Pixels outside it are
-// just black. Getting this right required checking the actual
-// generated dial data numerically (pixel value statistics only, not
-// viewing it as an image) - it revealed the sun/moon icons are only
-// ~12 and ~8 texels respectively against ~236 background texels, and
-// that DIAL_ZOOM alone left them small enough on screen to fit
-// entirely inside the visible area for many consecutive frames before
-// finally clipping at the very edge - which is exactly a rigid shape
-// sliding into view, not a shape changing as it moves.
-static const int WINDOW_CX = CENTER;
-static const int WINDOW_CY = 90;
-static const int WINDOW_R = 55;
+// Reaches exactly the screen's farthest corner (top-left/top-right,
+// since the pivot sits at the bottom): sqrt(0.5^2 + 1^2) / DIAL_ZOOM.
+static const float MASK_RADIUS = 1.1180339887f / DIAL_ZOOM;
 
-bool insideWindow(uint16_t x, uint16_t y) {
-  int32_t dx = (int32_t)x - WINDOW_CX;
-  int32_t dy = (int32_t)y - WINDOW_CY;
-  return (dx * dx + dy * dy) <= (WINDOW_R * WINDOW_R);
+// Number of discrete shade bands the falloff snaps to (plus fully-dark
+// below the lowest band) - a smooth analog gradient here fights the
+// blocky pixel-art look everywhere else; pixel art shades in a handful
+// of visible steps, not a continuous fade.
+static const int MASK_LEVELS = 4;
+
+// Stands in for pix.r in the original - see the comment block above.
+float itemMask(float u, float v) {
+  float r = sqrtf(u * u + v * v) / MASK_RADIUS;
+  float mask = 1.0f - r;
+  if (mask <= 0.0f) return 0.0f;
+  if (mask >= 1.0f) return 1.0f;
+  int level = (int)(mask * MASK_LEVELS); // 0..MASK_LEVELS-1
+  return (level + 1) / (float)MASK_LEVELS;
+}
+
+// dial_pix.rgb *= pix.r, for a packed RGB565 pixel.
+uint16_t scaleColor565(uint16_t color, float factor) {
+  uint8_t r = (uint8_t)(((color >> 11) & 0x1F) * factor);
+  uint8_t g = (uint8_t)(((color >> 5) & 0x3F) * factor);
+  uint8_t b = (uint8_t)((color & 0x1F) * factor);
+  return (uint16_t)((r << 11) | (g << 5) | b);
 }
 
 void renderDial(float dialAngle) {
@@ -194,17 +194,14 @@ void renderDial(float dialAngle) {
     TFT_eSPI* surface = surfaceFor(y);
     uint16_t ly = localY(y);
     for (uint16_t x = 0; x < SCREEN_SIZE; x++) {
-      if (!insideWindow(x, y)) {
-        surface->drawPixel(x, ly, TFT_BLACK);
-        continue;
-      }
       float u = -(x / (float)(SCREEN_SIZE - 1) - 0.5f) / DIAL_ZOOM;
+      float mask = itemMask(u, v);
       int32_t dx = (int32_t)((u * ry + v * rx + 0.5f) * DIAL_WIDTH)  % DIAL_WIDTH;
       int32_t dy = (int32_t)((v * ry - u * rx + 0.5f) * DIAL_HEIGHT) % DIAL_HEIGHT;
       if (dx < 0) dx += DIAL_WIDTH;
       if (dy < 0) dy += DIAL_HEIGHT;
       uint16_t dialPix = pgm_read_word(&dial[dy * DIAL_WIDTH + dx]);
-      surface->drawPixel(x, ly, dialPix);
+      surface->drawPixel(x, ly, scaleColor565(dialPix, mask));
     }
   }
 }
